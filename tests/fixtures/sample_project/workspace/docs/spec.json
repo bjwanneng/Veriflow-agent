@@ -1,0 +1,55 @@
+{
+  "design_name": "simple_alu",
+  "version": "1.0.0",
+  "target_kpis": {
+    "frequency_mhz": 100,
+    "max_cells": 500,
+    "power_mw": 50
+  },
+  "modules": [
+    {
+      "module_name": "alu",
+      "module_type": "leaf",
+      "ports": [
+        {"name": "clk", "direction": "input", "width": 1},
+        {"name": "rst_n", "direction": "input", "width": 1},
+        {"name": "a", "direction": "input", "width": 4},
+        {"name": "b", "direction": "input", "width": 4},
+        {"name": "op", "direction": "input", "width": 2},
+        {"name": "result", "direction": "output", "width": 4},
+        {"name": "zero", "direction": "output", "width": 4}
+      ],
+      "fsm": {
+        "states": ["IDLE", "ADD", "SUB", "AND", "OR", "XOR", "NOT"],
+        "initial": "IDLE",
+        "transitions": [
+          {"from": "IDLE", "to": "ADD", "op": "00"},
+          {"from": "IDLE", "to": "SUB", "op": "01"},
+          {"from": "IDLE", "to": "AND", "op": "10"},
+          {"from": "IDLE", "to": "OR", "op": "11"},
+          {"from": "IDLE", "to": "XOR", "op": "12"},
+          {"from": "IDLE", "to": "NOT", "op": "13"}
+        ]
+      }
+    },
+    {
+      "module_name": "top",
+      "module_type": "top",
+      "ports": [
+        {"name": "clk", "direction": "input", "width": 1},
+        {"name": "rst_n", "direction": "input", "width": 1},
+        {"name": "a", "direction": "input", "width": 4},
+        {"name": "b", "direction": "input", "width": 4},
+        {"name": "result", "direction": "output", "width": 4}
+      ],
+      "submodules": ["alu"]
+    }
+  ],
+  "connectivity": [
+    {"from": "top", "to": "alu", "signal": "a"},
+    {"from": "top", "to": "alu", "signal": "b"}
+  ],
+  "clock_domains": [
+    {"name": "clk", "frequency_mhz": 100}
+  ]
+}
