@@ -16,6 +16,8 @@ The graph uses:
 
 from __future__ import annotations
 
+import logging
+import time
 from pathlib import Path
 from typing import Any, Literal
 
@@ -37,6 +39,8 @@ from veriflow_agent.agents.debugger import DebuggerAgent
 from veriflow_agent.agents.synth import SynthAgent
 from veriflow_agent.tools.lint import IverilogTool
 from veriflow_agent.tools.simulate import VvpTool
+
+logger = logging.getLogger("veriflow")
 
 
 # ── Node wrapper functions ────────────────────────────────────────────
@@ -64,17 +68,19 @@ def _run_stage(
         **extra_ctx,
     }
 
+    t0 = time.perf_counter()
     try:
         result = agent.execute(context)
     except Exception as e:
-        result = agent.__class__.__new__(agent.__class__)
-        # Build a failure AgentResult
         from veriflow_agent.agents.base import AgentResult
         result = AgentResult(
             success=False,
             stage=agent.name,
             errors=[f"Unhandled exception: {e}"],
         )
+    elapsed = time.perf_counter() - t0
+    status = "PASS" if result.success else "FAIL"
+    logger.info("[%s] %s completed in %.2fs", status, agent.name, elapsed)
 
     stage_name = agent.name
     updates: dict[str, Any] = {
@@ -106,6 +112,7 @@ def _run_stage(
         errors=result.errors,
         warnings=result.warnings,
         metadata=result.metadata,
+        duration_s=round(elapsed, 2),
     )
     updates[f"{stage_name}_output"] = stage_output
 
@@ -167,6 +174,10 @@ def node_skill_d(state: VeriFlowState) -> dict[str, Any]:
                     parsed = lint_tool.parse_lint_output(lint_result)
 
                     if parsed.passed:
+                        # Update skill_d output to reflect lint pass
+                        quality_gates = dict(state.get("quality_gates_passed", {}))
+                        quality_gates["skill_d_lint"] = True
+                        updates["quality_gates_passed"] = quality_gates
                         break
 
                     # Lint failed → invoke debugger
@@ -185,6 +196,12 @@ def node_skill_d(state: VeriFlowState) -> dict[str, Any]:
 
                     # Refresh file list (debugger may have changed files)
                     non_tb = IverilogTool.filter_testbench_files(list(rtl_dir.glob("*.v")))
+
+                    # If this was the last attempt, record lint failure
+                    if attempt == max_retries - 1:
+                        quality_gates = dict(state.get("quality_gates_passed", {}))
+                        quality_gates["skill_d_lint"] = False
+                        updates["quality_gates_passed"] = quality_gates
 
     return updates
 

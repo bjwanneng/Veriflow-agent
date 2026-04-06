@@ -239,6 +239,17 @@ class BaseAgent(ABC):
 
         return len(missing) == 0, found, missing
 
+    def _resolve_prompt_path(self) -> Path:
+        """Resolve prompt file path with CWD and package fallback."""
+        prompt_path = Path("prompts") / self.prompt_file
+        if prompt_path.exists() and prompt_path.is_file():
+            return prompt_path
+        # Fallback: relative to package source
+        pkg_prompt = Path(__file__).resolve().parent.parent.parent / "prompts" / self.prompt_file
+        if pkg_prompt.exists() and pkg_prompt.is_file():
+            return pkg_prompt
+        raise LLMInvocationError(f"Prompt file not found: {self.prompt_file}")
+
     def render_prompt(self, context: dict[str, Any]) -> str:
         """Read the prompt file and substitute {{KEY}} placeholders.
 
@@ -256,10 +267,7 @@ class BaseAgent(ABC):
         if not self.prompt_file:
             raise LLMInvocationError("No prompt file configured for this agent")
 
-        prompt_path = Path("prompts") / self.prompt_file
-        if not prompt_path.exists() or not prompt_path.is_file():
-            raise LLMInvocationError(f"Prompt file not found: {prompt_path}")
-
+        prompt_path = self._resolve_prompt_path()
         content = prompt_path.read_text(encoding="utf-8")
 
         for key, value in context.items():
@@ -339,18 +347,19 @@ class BaseAgent(ABC):
         try:
             result = subprocess.run(
                 [claude_exe, "--print", "--dangerously-skip-permissions"],
-                input=json.dumps(stdin_data),
+                input=json.dumps(stdin_data).encode("utf-8"),
                 capture_output=True,
-                text=True,
                 timeout=600,  # 10 minute timeout
             )
+            stdout = result.stdout.decode("utf-8", errors="replace")
+            stderr = result.stderr.decode("utf-8", errors="replace")
 
             if result.returncode != 0:
                 raise LLMInvocationError(
-                    f"Claude CLI failed with code {result.returncode}: {result.stderr}"
+                    f"Claude CLI failed with code {result.returncode}: {stderr}"
                 )
 
-            return result.stdout
+            return stdout
 
         except subprocess.TimeoutExpired:
             raise LLMInvocationError("Claude CLI timed out after 10 minutes")
@@ -382,10 +391,7 @@ class BaseAgent(ABC):
         if prompt_override:
             prompt_content = prompt_override
         else:
-            prompt_path = Path("prompts") / self.prompt_file
-            if not prompt_path.exists():
-                raise LLMInvocationError(f"Prompt file not found: {prompt_path}")
-            prompt_content = prompt_path.read_text(encoding="utf-8")
+            prompt_content = self._resolve_prompt_path().read_text(encoding="utf-8")
 
         # Call API
         try:
@@ -426,10 +432,7 @@ class BaseAgent(ABC):
         if prompt_override:
             prompt_content = prompt_override
         else:
-            prompt_path = Path("prompts") / self.prompt_file
-            if not prompt_path.exists():
-                raise LLMInvocationError(f"Prompt file not found: {prompt_path}")
-            prompt_content = prompt_path.read_text(encoding="utf-8")
+            prompt_content = self._resolve_prompt_path().read_text(encoding="utf-8")
 
         # Create prompt template
         messages = [("human", prompt_content)]

@@ -207,8 +207,22 @@ class CoderAgent(BaseAgent):
                 errors=[f"LLM invocation failed for {module_name}: {e}"],
             )
 
-        # Check if file was written
+        # Extract Verilog from LLM output and write to file
         output_path = project_dir / "workspace" / "rtl" / f"{module_name}.v"
+        verilog_code = self._extract_verilog(llm_output)
+
+        if verilog_code:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(verilog_code, encoding="utf-8")
+            return AgentResult(
+                success=True,
+                stage=self.name,
+                artifacts=[str(output_path)],
+                metrics={"size_bytes": len(verilog_code)},
+                raw_output=llm_output[:1000],
+            )
+
+        # Fallback: check if file was written by LLM
         if output_path.exists():
             content = output_path.read_text(encoding="utf-8")
             return AgentResult(
@@ -225,6 +239,40 @@ class CoderAgent(BaseAgent):
             errors=[f"Module {module_name}: output file not created"],
             raw_output=llm_output[:1000],
         )
+
+    @staticmethod
+    def _extract_verilog(llm_output: str) -> str | None:
+        """Extract Verilog code from LLM output.
+
+        Looks for Verilog code in markdown code fences or raw module declarations.
+        """
+        import re
+
+        # Try markdown code fence with verilog/systemverilog label
+        v_match = re.search(
+            r"```(?:verilog|systemverilog|v)\s*\n([\s\S]*?)\n```",
+            llm_output,
+        )
+        if v_match:
+            return v_match.group(1).strip()
+
+        # Try any code fence that contains 'module'
+        v_match = re.search(
+            r"```\s*\n([\s\S]*?module\s+[\s\S]*?)\n```",
+            llm_output,
+        )
+        if v_match:
+            return v_match.group(1).strip()
+
+        # Try finding raw module ... endmodule
+        v_match = re.search(
+            r"(module\s+[\s\S]*?endmodule)",
+            llm_output,
+        )
+        if v_match:
+            return v_match.group(1).strip()
+
+        return None
 
     @staticmethod
     def _build_peer_summary(modules: list[dict]) -> str:

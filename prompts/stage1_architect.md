@@ -110,7 +110,7 @@ Create a complete specification file at `workspace/docs/spec.json`:
 
   "modules": [
     {
-      "name": "module_name",
+      "module_name": "module_name",
       "description": "What this module does",
       "module_type": "top|processing|control|memory|interface",
       "hierarchy_level": 0,

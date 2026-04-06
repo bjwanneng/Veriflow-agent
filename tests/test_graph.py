@@ -60,14 +60,14 @@ class TestGetModeStages:
         stages = get_mode_stages("quick")
         assert "architect" in stages
         assert "timing" not in stages
-        assert "debugger" not in stages
+        assert "sim_loop" not in stages
 
     def test_standard(self):
         stages = get_mode_stages("standard")
         assert "architect" in stages
         assert "timing" in stages
         assert "coder" in stages
-        assert "debugger" in stages
+        assert "sim_loop" in stages
         assert "synth" in stages
 
     def test_unknown_defaults_to_standard(self):

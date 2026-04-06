@@ -26,10 +26,10 @@ class ArchitectAgent(BaseAgent):
     Output: workspace/docs/spec.json
     """
 
-    def __init__(self):
+    def __init__(self, prompt_file: str | None = None):
         super().__init__(
             name="architect",
-            prompt_file="stage1_architect.md",
+            prompt_file=prompt_file or "stage1_architect.md",
             required_inputs=["requirement.md"],
             output_artifacts=["workspace/docs/spec.json"],
             max_retries=1,
@@ -70,7 +70,12 @@ class ArchitectAgent(BaseAgent):
         if config_path.exists():
             config_text = config_path.read_text(encoding="utf-8")
 
-        # Step 3: Build LLM context
+        # Step 3: Use quick mode prompt if applicable
+        prompt_file = self.prompt_file
+        if mode == "quick" and prompt_file == "stage1_architect.md":
+            prompt_file = "stage1_architect_quick.md"
+
+        # Step 4: Build LLM context
         llm_context = {
             "PROJECT_DIR": str(project_dir),
             "MODE": mode,
@@ -80,9 +85,12 @@ class ArchitectAgent(BaseAgent):
             "FREQUENCY_MHZ": str(context.get("frequency_mhz", "100")),
         }
 
-        # Step 4: Invoke LLM
+        # Step 4: Invoke LLM (use local prompt_file to avoid mutating self)
         try:
+            original_prompt_file = self.prompt_file
+            self.prompt_file = prompt_file
             prompt = self.render_prompt(llm_context)
+            self.prompt_file = original_prompt_file  # Restore
             llm_output = self.call_llm(context, prompt_override=prompt)
         except Exception as e:
             return AgentResult(

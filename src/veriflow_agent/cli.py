@@ -12,7 +12,9 @@ Usage:
 from __future__ import annotations
 
 import json
+import logging
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -28,6 +30,7 @@ from veriflow_agent.graph import create_veriflow_graph, create_initial_state
 
 
 console = Console()
+logger = logging.getLogger("veriflow")
 
 
 @click.group()
@@ -80,19 +83,23 @@ def run(project_dir: str, mode: str, resume: bool, workers: int):
     config = {"configurable": {"thread_id": f"veriflow-{project_dir.name}"}}
 
     with console.status("[bold blue]Running pipeline...") as status:
+        result = None
+        t_pipeline_start = time.perf_counter()
         try:
             result = graph.invoke(state, config)
         except KeyboardInterrupt:
             console.print("\n[yellow]Pipeline interrupted by user.")
-            _save_checkpoint(project_dir, state)
+            _save_checkpoint(project_dir, result or state)
             sys.exit(1)
         except Exception as e:
             console.print(f"\n[red]Pipeline failed: {e}")
-            _save_checkpoint(project_dir, state)
+            _save_checkpoint(project_dir, result or state)
             sys.exit(1)
 
     # Display results
+    total_time = time.perf_counter() - t_pipeline_start
     _display_results(result)
+    console.print(f"\n[bold]Total pipeline time:[/bold] {total_time:.1f}s")
 
 
 @cli.command()
@@ -154,7 +161,8 @@ def _load_checkpoint(project_dir: Path) -> Optional[dict]:
         return None
     try:
         return json.loads(checkpoint.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError,):
+    except json.JSONDecodeError as e:
+        console.print(f"[yellow]Warning: Checkpoint file is corrupted ({e}). Starting fresh.")
         return None
 
 
@@ -252,13 +260,22 @@ def _validate_stage(stage: int, project_dir: Path) -> list[str]:
     return errors
 
 
+def _safe_get(obj, key, default=None):
+    """Safely access attribute or dict key from stage output."""
+    if hasattr(obj, key):
+        return getattr(obj, key)
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
+
+
 def _display_results(result: dict) -> None:
     """Display pipeline results using Rich."""
     completed = result.get("stages_completed", [])
     failed = result.get("stages_failed", [])
 
     if not failed:
-        console.print("\n[bold green]Pipeline completed successfully![ ")
+        console.print("\n[bold green]Pipeline completed successfully![/bold green]")
     else:
         console.print(f"\n[bold red]Pipeline failed at stages: {failed}")
 
@@ -267,16 +284,21 @@ def _display_results(result: dict) -> None:
     table.add_column("Stage", style="bold")
     table.add_column("Status", style="bold")
     table.add_column("Artifacts")
+    table.add_column("Time", justify="right")
 
     for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"]:
         output = result.get(f"{stage_name}_output")
         if output:
-            status = "[green]PASS" if output.get("success") else "[red]FAIL"
-            artifacts = ", ".join(output.get("artifacts", [])) if output.get("artifacts") else "-"
-            table.add_row(stage_name, status, artifacts)
+            success = _safe_get(output, "success", False)
+            status = "[green]PASS" if success else "[red]FAIL"
+            artifacts_list = _safe_get(output, "artifacts", []) or []
+            artifacts = ", ".join(artifacts_list) if artifacts_list else "-"
+            dur_s = _safe_get(output, "duration_s", 0.0)
+            time_str = f"{dur:.1f}s" if dur_s > 0 else "-"
+            table.add_row(stage_name, status, artifacts, time_str)
 
         else:
-            table.add_row(stage_name, "[dim]-", "-")
+            table.add_row(stage_name, "[dim]-", "-", "-")
 
     console.print(table)
 
@@ -284,51 +306,34 @@ def _display_results(result: dict) -> None:
     metrics_panel_parts = []
     for stage_name in ["architect", "coder", "synth"]:
         output = result.get(f"{stage_name}_output")
-        if output and output.get("metrics"):
-            metrics_panel_parts.append(f"[bold]{stage_name}:[/] {output['metrics']}")
+        if output:
+            metrics = _safe_get(output, "metrics", None)
+            if metrics:
+                metrics_panel_parts.append(f"[bold]{stage_name}:[/] {metrics}")
 
     if metrics_panel_parts:
         console.print("\n".join(metrics_panel_parts))
 
+    # Show timing summary
+    total_duration = 0.0
+    stage_times = []
+    for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"]:
+        output = result.get(f"{stage_name}_output")
+        if output:
+            dur = _safe_get(output, "duration_s", 0.0)
+            if dur > 0:
+                stage_times.append((stage_name, dur))
 
-@cli.command()
-@click.option("--port", default=8501, help="Port to run the UI on.")
-@click.option("--host", default="localhost", help="Host to bind the UI to.")
-def ui(port: int, host: str):
-    """Launch the Streamlit Web UI for VeriFlow-Agent."""
-    import subprocess
-    import sys
+                total_duration += dur
 
-    # Find the app.py file
-    from pathlib import Path
-
-    ui_app = Path(__file__).parent / "ui" / "app.py"
-
-    if not ui_app.exists():
-        console.print(f"[red]UI app not found at {ui_app}")
-        sys.exit(1)
-
-    console.print(f"[green]Starting VeriFlow-Agent Web UI...")
-    console.print(f"[dim]URL: http://{host}:{port}")
-    console.print("")
-
-    # Launch streamlit
-    cmd = [
-        sys.executable, "-m", "streamlit", "run",
-        str(ui_app),
-        "--server.port", str(port),
-        "--server.host", host,
-        "--browser.serverAddress", host,
-        "--server.headless", "true",
-    ]
-
-    try:
-        subprocess.run(cmd, check=True)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]UI stopped by user.")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]UI failed with exit code {e.returncode}")
-        sys.exit(1)
+    if stage_times:
+        timing_table = Table(title="Timing Summary")
+        timing_table.add_column("Stage", style="bold")
+        timing_table.add_column("Duration", justify="right")
+        for name, dur in stage_times:
+            timing_table.add_row(name, f"{dur:.2f}s")
+        timing_table.add_row("[bold]Total[/]", f"{total_duration:.2f}s")
+        console.print(timing_table)
 
 
 @cli.command()
@@ -352,13 +357,16 @@ def ui(port: int, host: str):
     console.print(f"[dim]URL: http://{host}:{port}")
     console.print("")
 
-    # Launch streamlit
+    # Launch streamlit with the installed file path
+    import veriflow_agent.ui.app as _ui_mod
+
+    ui_app = Path(_ui_mod.__file__)
+
     cmd = [
         sys.executable, "-m", "streamlit", "run",
         str(ui_app),
         "--server.port", str(port),
-        "--server.host", host,
-        "--browser.serverAddress", host,
+        "--server.address", host,
         "--server.headless", "true",
     ]
 

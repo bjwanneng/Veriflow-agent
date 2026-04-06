@@ -21,6 +21,7 @@ class StageOutput:
         errors: List of error messages if any
         warnings: List of warning messages
         metadata: Additional stage-specific data
+        duration_s: Wall-clock time of this stage in seconds
     """
     success: bool
     artifacts: list[str] = field(default_factory=list)
@@ -28,6 +29,7 @@ class StageOutput:
     errors: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    duration_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -38,6 +40,7 @@ class StageOutput:
             "errors": self.errors,
             "warnings": self.warnings,
             "metadata": self.metadata,
+            "duration_s": self.duration_s,
         }
 
     @classmethod
@@ -50,6 +53,7 @@ class StageOutput:
             errors=data.get("errors", []),
             warnings=data.get("warnings", []),
             metadata=data.get("metadata", {}),
+            duration_s=data.get("duration_s", 0.0),
         )
 
 
@@ -133,7 +137,7 @@ def create_initial_state(
             "timing": 0,
             "coder": 0,
             "skill_d": 0,
-            "debugger": 0,
+            "sim_loop": 0,
             "synth": 0,
         },
         architect_output=None,
@@ -159,7 +163,7 @@ def get_mode_stages(mode: str) -> list[str]:
     """
     stages_map = {
         "quick": ["architect", "microarch", "coder", "skill_d"],
-        "standard": ["architect", "microarch", "timing", "coder", "skill_d", "debugger", "synth"],
-        "enterprise": ["architect", "microarch", "timing", "coder", "skill_d", "debugger", "synth"],
+        "standard": ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"],
+        "enterprise": ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"],
     }
     return stages_map.get(mode, stages_map["standard"])
