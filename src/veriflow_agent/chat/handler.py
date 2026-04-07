@@ -1,7 +1,10 @@
 """Pipeline chat handler — bridges Gradio UI ↔ LangGraph pipeline.
 
-Streams pipeline progress as markdown messages by iterating over
-graph.stream() events and formatting each stage transition.
+Supports two modes:
+- Conversational chat: General questions answered directly by the LLM
+- Pipeline execution: Full RTL design pipeline triggered by explicit design requests
+
+Intent classification determines which mode to use.
 """
 
 from __future__ import annotations
@@ -30,20 +33,41 @@ from veriflow_agent.chat.formatters import (
     format_final_summary,
     format_inspection_response,
 )
+from veriflow_agent.chat.llm import (
+    LLMConfig,
+    call_llm_stream,
+    call_llm,
+    CHAT_SYSTEM_PROMPT,
+)
 
 logger = logging.getLogger("veriflow")
 
-# Keywords for intent classification
+# ── Intent classification ───────────────────────────────────────────────
+
+# Strong signals that the user wants to START a design pipeline
+_DESIGN_SIGNALS = {
+    "design a", "create a", "implement a", "build a", "generate",
+    "write verilog", "write rtl", "rtl code", "verilog module",
+    "i need a", "help me design", "help me create", "help me build",
+    "produce a", "synthesize", "make a circuit", "digital circuit",
+    "fpga module", "asic design", "pipeline", "start design",
+    "设计", "实现", "生成", "编写",
+}
+
+# Inspection: user wants to see existing outputs
 _INSPECT_KEYWORDS = {
     "show", "display", "read", "what", "view", "open",
     "rtl", "code", "verilog", "spec", "report", "timing",
     "synthesis", "quality", "files", "result", "list",
+    "查看", "显示",
 }
 
+# Modification: user wants to change existing design
 _MODIFY_KEYWORDS = {
     "add", "modify", "change", "update", "fix", "remove",
     "increase", "decrease", "extend", "reduce", "rename",
     "replace", "insert", "delete",
+    "修改", "增加", "删除", "更新",
 }
 
 
@@ -51,7 +75,8 @@ class PipelineChatHandler:
     """Bridges Gradio ChatInterface ↔ LangGraph pipeline.
 
     Handles multi-turn conversation:
-    - New design: Creates project dir, runs full pipeline
+    - Chat: General questions answered by LLM directly
+    - Design: Creates project dir, runs full pipeline
     - Inspection: Reads generated files from project dir
     - Modification: Updates requirement, re-runs pipeline
     """
@@ -59,6 +84,17 @@ class PipelineChatHandler:
     def __init__(self):
         self._project_dirs: dict[str, Path] = {}  # session_id -> Path
         self._pipeline_running: dict[str, bool] = {}
+        self._llm_configs: dict[str, LLMConfig] = {}  # session_id -> config
+
+    def set_llm_config(self, session_id: str, config: LLMConfig) -> None:
+        """Update LLM configuration for a session."""
+        self._llm_configs[session_id] = config
+
+    def get_llm_config(self, session_id: str) -> LLMConfig:
+        """Get LLM config for session, creating default if needed."""
+        if session_id not in self._llm_configs:
+            self._llm_configs[session_id] = LLMConfig()
+        return self._llm_configs[session_id]
 
     def handle_message(
         self,
@@ -69,51 +105,93 @@ class PipelineChatHandler:
         """Main chat entry point. Called by Gradio for each user message.
 
         Yields incremental markdown strings for streaming display.
-
-        Args:
-            message: User's chat message.
-            history: Chat history in Gradio message format.
-            session_id: Session identifier for project isolation.
-
-        Yields:
-            Markdown strings (accumulated, each yield replaces previous).
         """
-        # Classify intent
         intent = self._classify_intent(message, history)
 
         if intent == "inspect":
             yield from self._handle_inspection(message, session_id)
         elif intent == "modify":
             yield from self._handle_modification(message, session_id)
-        else:
+        elif intent == "design":
             yield from self._handle_new_design(message, session_id)
+        else:
+            # Default: conversational chat
+            yield from self._handle_chat(message, history, session_id)
 
     def _classify_intent(self, message: str, history: list[dict]) -> str:
-        """Classify user message intent."""
-        msg_lower = message.lower().strip()
-        msg_words = set(re.findall(r'\w+', msg_lower))
+        """Classify user message intent.
 
-        # If no pipeline run yet, always treat as new design
-        if not history or not any(
+        Priority: inspect > modify > design > chat
+        Design is only triggered by explicit design request signals.
+        """
+        msg_lower = message.lower().strip()
+
+        # Check if this is a pipeline-triggering design request
+        has_design_signal = any(sig in msg_lower for sig in _DESIGN_SIGNALS)
+
+        # Check if there's an existing project (pipeline has been run)
+        has_project = any(
             r.get("role") == "assistant" and "Pipeline" in r.get("content", "")
             for r in history
-        ):
-            return "new"
+        )
 
-        # Check for inspection keywords
-        if msg_words & _INSPECT_KEYWORDS:
+        # 1. Inspection: user wants to view existing outputs
+        msg_words = set(re.findall(r'\w+', msg_lower))
+        if has_project and (msg_words & _INSPECT_KEYWORDS) and len(msg_lower) < 100:
             return "inspect"
 
-        # Check for modification keywords
-        if msg_words & _MODIFY_KEYWORDS:
+        # 2. Modification: user wants to change existing design
+        if has_project and (msg_words & _MODIFY_KEYWORDS) and len(msg_lower) < 200:
             return "modify"
 
-        # Short message likely inspection
-        if len(msg_lower) < 30:
-            return "inspect"
+        # 3. Design: explicit design request
+        if has_design_signal and len(msg_lower) > 15:
+            return "design"
 
-        # Default: new design
-        return "new"
+        # 4. Default: chat
+        return "chat"
+
+    # ── Conversational chat ──────────────────────────────────────────
+
+    def _handle_chat(
+        self,
+        message: str,
+        history: list[dict],
+        session_id: str,
+    ) -> Generator[str, None, None]:
+        """Handle general conversation using the LLM directly."""
+        config = self.get_llm_config(session_id)
+
+        # Build conversation context from history (last 10 messages)
+        recent_history = history[-10:] if history else []
+        llm_messages = []
+        for msg in recent_history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role in ("user", "assistant") and content:
+                llm_messages.append({"role": role, "content": content})
+
+        # Add current message
+        llm_messages.append({"role": "user", "content": message})
+
+        try:
+            accumulated = ""
+            for chunk in call_llm_stream(llm_messages, config):
+                accumulated += chunk
+                yield accumulated
+        except Exception as e:
+            error_msg = str(e)
+            logger.warning(f"Chat LLM failed: {error_msg}")
+            yield (
+                f"I couldn't connect to the LLM backend.\n\n"
+                f"**Error:** {error_msg}\n\n"
+                f"Please configure your LLM settings in the sidebar "
+                f"(API key, model, backend).\n\n"
+                f"If you want to start a design, describe the circuit in detail, "
+                f"e.g.: *\"Design a 4-bit ALU supporting ADD, SUB, AND, OR\"*"
+            )
+
+    # ── Pipeline modes ───────────────────────────────────────────────
 
     def _handle_inspection(
         self, message: str, session_id: str,
@@ -121,7 +199,7 @@ class PipelineChatHandler:
         """Handle file inspection queries."""
         project_dir = self._project_dirs.get(session_id)
         if not project_dir or not project_dir.exists():
-            yield "No project found. Please start a new design first.\n\nExample: *Design a 4-bit ALU supporting ADD, SUB, AND, OR operations*"
+            yield "No project found. Please start a new design first.\n\nExample: *\"Design a 4-bit ALU supporting ADD, SUB, AND, OR operations\"*"
             return
 
         yield format_inspection_response(message, project_dir)
@@ -149,14 +227,12 @@ class PipelineChatHandler:
 
         yield from self._run_pipeline(project_dir, session_id)
 
+    # ── Pipeline execution ───────────────────────────────────────────
+
     def _run_pipeline(
         self, project_dir: Path, session_id: str,
     ) -> Generator[str, None, None]:
-        """Execute the LangGraph pipeline with streaming.
-
-        Uses graph.stream() to get per-node state updates.
-        Each update is formatted and yielded as markdown.
-        """
+        """Execute the LangGraph pipeline with streaming."""
         self._pipeline_running[session_id] = True
 
         try:

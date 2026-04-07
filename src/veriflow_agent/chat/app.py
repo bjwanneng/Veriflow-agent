@@ -13,6 +13,7 @@ from pathlib import Path
 import gradio as gr
 
 from veriflow_agent.chat.handler import PipelineChatHandler
+from veriflow_agent.chat.llm import LLMConfig
 
 logger = logging.getLogger("veriflow")
 
@@ -298,22 +299,33 @@ DARK_CSS = """
 }
 
 /* Settings section in sidebar */
-.vf-settings-row {
-    display: flex !important;
-    align-items: center !important;
-    justify-content: space-between !important;
-    padding: 6px 10px !important;
-    font-size: 12px !important;
+.vf-sidebar label {
     color: #565f89 !important;
-}
-.vf-settings-label {
-    font-family: 'Cascadia Code', 'Fira Code', monospace !important;
     font-size: 11px !important;
+    font-weight: 600 !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.8px !important;
 }
-.vf-settings-value {
+.vf-sidebar input,
+.vf-sidebar select,
+.vf-select input,
+.vf-input input {
+    background: #1a1b26 !important;
+    border: 1px solid #292e42 !important;
     color: #a9b1d6 !important;
-    font-family: monospace !important;
-    font-size: 11px !important;
+    font-size: 12px !important;
+    border-radius: 4px !important;
+    font-family: 'Cascadia Code', 'Fira Code', monospace !important;
+}
+.vf-sidebar input:focus,
+.vf-select input:focus,
+.vf-input input:focus {
+    border-color: #7aa2f7 !important;
+}
+.vf-sidebar .svelte-1gfkn6j {
+    background: #1a1b26 !important;
+    border-color: #292e42 !important;
+    color: #a9b1d6 !important;
 }
 """
 
@@ -385,15 +397,31 @@ def _build_interface() -> gr.Blocks:
                 )
 
                 gr.HTML("<h3>Settings</h3>")
-                gr.HTML(
-                    '<div class="vf-settings-row">'
-                    '  <span class="vf-settings-label">LLM</span>'
-                    '  <span class="vf-settings-value">claude_cli</span>'
-                    "</div>"
-                    '<div class="vf-settings-row">'
-                    '  <span class="vf-settings-label">Budget</span>'
-                    '  <span class="vf-settings-value">1M tokens</span>'
-                    "</div>"
+                llm_backend = gr.Dropdown(
+                    choices=["claude_cli", "anthropic", "openai"],
+                    value="claude_cli",
+                    label="LLM Backend",
+                    elem_classes=["vf-select"],
+                    interactive=True,
+                )
+                api_key_input = gr.Textbox(
+                    placeholder="API Key (optional for claude_cli)",
+                    label="API Key",
+                    type="password",
+                    elem_classes=["vf-input"],
+                    interactive=True,
+                )
+                base_url_input = gr.Textbox(
+                    placeholder="https://api.example.com/v1",
+                    label="Base URL",
+                    elem_classes=["vf-input"],
+                    interactive=True,
+                )
+                model_input = gr.Textbox(
+                    placeholder="e.g. claude-sonnet-4-6, gpt-4o, deepseek-v3",
+                    label="Model",
+                    elem_classes=["vf-input"],
+                    interactive=True,
                 )
 
                 clear_btn = gr.Button(
@@ -431,9 +459,32 @@ def _build_interface() -> gr.Blocks:
         def _init_session():
             return str(uuid.uuid4())[:8]
 
-        def _send(message, history, sid):
+        def _save_settings(backend, api_key, base_url, model, sid):
+            """Persist LLM settings to handler for the session."""
             if not sid:
                 sid = str(uuid.uuid4())[:8]
+            config = LLMConfig(
+                backend=backend,
+                api_key=api_key or "",
+                base_url=base_url or "",
+                model=model or "",
+            )
+            _handler.set_llm_config(sid, config)
+            return sid
+
+        def _send(message, history, sid, backend, api_key, base_url, model):
+            if not sid:
+                sid = str(uuid.uuid4())[:8]
+
+            # Save settings
+            config = LLMConfig(
+                backend=backend,
+                api_key=api_key or "",
+                base_url=base_url or "",
+                model=model or "",
+            )
+            _handler.set_llm_config(sid, config)
+
             if not message.strip():
                 yield history, sid, _build_sidebar_stages_html(), '<div style="color:#3b4261;font-size:12px;padding:8px 10px;">No files yet</div>'
                 return
@@ -442,11 +493,10 @@ def _build_interface() -> gr.Blocks:
             history = history + [{"role": "user", "content": message}]
             yield history, sid, _build_sidebar_stages_html(), '<div style="color:#3b4261;font-size:12px;padding:8px 10px;">No files yet</div>'
 
-            # Stream pipeline response
+            # Stream response
             full_response = ""
             for chunk in _handler.handle_message(message, history, sid):
                 full_response = chunk
-                # Update sidebar stages based on response content
                 sidebar_html = _update_stages_from_response(full_response)
                 files = _update_files_from_session(sid)
                 history_updated = history + [{"role": "assistant", "content": full_response}]
@@ -455,22 +505,21 @@ def _build_interface() -> gr.Blocks:
         def _clear():
             return [], str(uuid.uuid4())[:8], _build_sidebar_stages_html(), '<div style="color:#3b4261;font-size:12px;padding:8px 10px;">No files yet</div>'
 
+        _send_inputs = [msg_input, chatbot, session_id_state,
+                        llm_backend, api_key_input, base_url_input, model_input]
+        _outputs = [chatbot, session_id_state, sidebar_stages, files_html]
+
         # Send on button click or Enter
         send_btn.click(
-            _send,
-            inputs=[msg_input, chatbot, session_id_state],
-            outputs=[chatbot, session_id_state, sidebar_stages, files_html],
+            _send, inputs=_send_inputs, outputs=_outputs,
         ).then(lambda: "", outputs=[msg_input])
 
         msg_input.submit(
-            _send,
-            inputs=[msg_input, chatbot, session_id_state],
-            outputs=[chatbot, session_id_state, sidebar_stages, files_html],
+            _send, inputs=_send_inputs, outputs=_outputs,
         ).then(lambda: "", outputs=[msg_input])
 
         clear_btn.click(
-            _clear,
-            outputs=[chatbot, session_id_state, sidebar_stages, files_html],
+            _clear, outputs=_outputs,
         )
 
         # Load session ID on page load
