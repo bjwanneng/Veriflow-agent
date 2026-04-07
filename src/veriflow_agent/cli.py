@@ -392,5 +392,14 @@ def chat(host: str, port: int, share: bool):
     launch_chat(host=host, port=port, share=share)
 
 
+@cli.command()
+def tui():
+    """Launch the terminal UI (Textual TUI) for VeriFlow-Agent."""
+    from veriflow_agent.tui import VeriFlowApp
+
+    app = VeriFlowApp()
+    app.run()
+
+
 def main():
     cli()

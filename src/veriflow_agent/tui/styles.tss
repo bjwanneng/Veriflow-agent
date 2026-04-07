@@ -1,0 +1,293 @@
+/* ═══════════════════════════════════════════════════════════════
+   VeriFlow-Agent TUI — Midnight Forge Theme
+
+   Palette:
+     Background:    #1a1b2e  (deep midnight navy)
+     Surface:       #16161e  (charcoal panel)
+     Border:        #292e42  (muted indigo)
+     Text primary:  #a9b1d6  (soft lavender white)
+     Text dim:      #565f89  (muted slate)
+     Accent:        #7aa2f7  (electric blue)
+     Green:         #9ece6a  (success)
+     Red:           #f7768e  (error)
+     Amber:         #e0af68  (running/warning)
+   ═══════════════════════════════════════════════════════════════ */
+
+/* ── Global ─────────────────────────────────────────────────── */
+
+Screen {
+    background: #1a1b2e;
+    color: #a9b1d6;
+}
+
+/* ── Header / Footer ───────────────────────────────────────── */
+
+Header {
+    background: #16161e;
+    border-bottom: solid #292e42;
+    color: #7aa2f7;
+    text-style: bold;
+    dock: top;
+}
+
+Header .header--title {
+    color: #7aa2f7;
+    text-style: bold;
+}
+
+Footer {
+    background: #16161e;
+    border-top: solid #292e42;
+    color: #565f89;
+    dock: bottom;
+}
+
+Footer .footer--key {
+    color: #7aa2f7;
+    text-style: bold;
+}
+
+Footer .footer--description {
+    color: #565f89;
+}
+
+/* ── Main layout ────────────────────────────────────────────── */
+
+#main-layout {
+    height: 1fr;
+    width: 100%;
+}
+
+/* ── Sidebar ────────────────────────────────────────────────── */
+
+#sidebar {
+    width: 28;
+    min-width: 24;
+    max-width: 36;
+    background: #16161e;
+    border-right: solid #292e42;
+    padding: 1 1 1 0;
+    dock: left;
+}
+
+#sidebar.hidden {
+    display: none;
+}
+
+.section-header {
+    color: #565f89;
+    text-style: bold;
+    margin: 1 0 0 0;
+    padding: 0 0 0 1;
+    text-transform: uppercase;
+}
+
+.spacer {
+    height: 1;
+}
+
+.sidebar-section {
+    margin: 0 1;
+    padding: 0;
+}
+
+.sidebar-btn {
+    width: 100%;
+    margin: 0 1;
+}
+
+/* Stage indicator rows */
+StageIndicator {
+    height: auto;
+    padding: 0 1;
+    margin: 0;
+    content-align: left middle;
+}
+
+StageIndicator:hover {
+    background: #1a1b2e;
+}
+
+/* Collapsible sections */
+Collapsible {
+    border: none;
+    margin: 0;
+    padding: 0;
+}
+
+Collapsible .collapsible--title {
+    color: #565f89;
+    text-style: bold;
+    background: transparent;
+    padding: 0;
+}
+
+Collapsible .collapsible--title:hover {
+    color: #7aa2f7;
+}
+
+/* Settings inputs */
+#sidebar Input {
+    margin: 0 0 0 0;
+    background: #1a1b2e;
+    border: tall #292e42;
+    color: #a9b1d6;
+    padding: 0 1;
+}
+
+#sidebar Input:focus {
+    border: tall #7aa2f7;
+}
+
+#sidebar Input.-placeholder {
+    color: #3b4261;
+}
+
+#sidebar Select {
+    margin: 0 0 1 0;
+    background: #1a1b2e;
+    border: tall #292e42;
+    color: #a9b1d6;
+}
+
+#sidebar Select:focus {
+    border: tall #7aa2f7;
+}
+
+/* ── Chat area ──────────────────────────────────────────────── */
+
+#chat-area {
+    width: 1fr;
+    height: 1fr;
+    background: #1a1b2e;
+}
+
+.chat-log {
+    height: 1fr;
+    width: 100%;
+    background: #1a1b2e;
+    border: none;
+    padding: 1 2;
+    scrollbar-size: 1 1;
+    scrollbar-color: #292e42 #16161e;
+}
+
+/* ── Input row ──────────────────────────────────────────────── */
+
+.input-row {
+    height: auto;
+    min-height: 5;
+    max-height: 12;
+    dock: bottom;
+    background: #16161e;
+    border-top: solid #292e42;
+    padding: 1 2;
+    layout: horizontal;
+}
+
+.msg-input {
+    width: 1fr;
+    height: auto;
+    min-height: 3;
+    max-height: 8;
+    background: #1a1b2e;
+    border: tall #292e42;
+    color: #a9b1d6;
+    padding: 0 1;
+}
+
+.msg-input:focus {
+    border: tall #7aa2f7;
+}
+
+.msg-input .text-area--cursor {
+    color: #7aa2f7;
+    background: #7aa2f7 30%;
+}
+
+.send-btn {
+    width: auto;
+    min-width: 10;
+    height: 3;
+    margin: 0 0 0 1;
+    background: #7aa2f7;
+    color: #1a1b2e;
+    text-style: bold;
+    border: none;
+}
+
+.send-btn:hover {
+    background: #89b4fa;
+}
+
+/* ── Buttons ────────────────────────────────────────────────── */
+
+Button {
+    background: #292e42;
+    color: #a9b1d6;
+    border: none;
+    padding: 0 2;
+}
+
+Button:hover {
+    background: #3b4261;
+    color: #c0caf5;
+}
+
+Button.-primary {
+    background: #7aa2f7;
+    color: #1a1b2e;
+    text-style: bold;
+}
+
+Button.-primary:hover {
+    background: #89b4fa;
+}
+
+Button.-success {
+    background: #9ece6a 80%;
+    color: #1a1b2e;
+    text-style: bold;
+}
+
+Button.-success:hover {
+    background: #9ece6a;
+}
+
+/* ── Scrollbar ──────────────────────────────────────────────── */
+
+VerticalScroll > .scrollbar {
+    background: #16161e;
+    color: #292e42;
+}
+
+VerticalScroll > .scrollbar:hover {
+    color: #3b4261;
+}
+
+RichLog > .scrollbar {
+    background: #16161e;
+    color: #292e42;
+}
+
+RichLog > .scrollbar:hover {
+    color: #3b4261;
+}
+
+/* ── Focus ring ─────────────────────────────────────────────── */
+
+*:focus {
+    tint: #7aa2f7 10%;
+}
+
+TextArea:focus {
+    border: tall #7aa2f7;
+}
+
+/* ── Rich text overrides ────────────────────────────────────── */
+
+RichLog {
+    link-style: bold underline #7aa2f7;
+    link-hover-style: bold underline #89b4fa;
+    link-hover-background: #292e42;
+}
