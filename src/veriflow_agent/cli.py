@@ -1,10 +1,9 @@
 """VeriFlow-Agent CLI entry point.
 
 Provides the command-line interface for the RTL design pipeline.
-Compatible with the original veriflow_ctl.py CLI structure.
 
 Usage:
-    veriflow-agent run --project-dir /path/to/project [--mode standard]
+    veriflow-agent run --project-dir /path/to/project
     veriflow-agent validate --stage 1 --project-dir /path/to/project
     veriflow-agent complete --stage 1 --project-dir /path/to/project
 """
@@ -41,10 +40,8 @@ def cli():
 
 @cli.command()
 @click.option("--project-dir", required=True, help="Path to the project directory.")
-@click.option("--mode", default="standard", type=str, help="Pipeline mode (quick/standard/enterprise).")
 @click.option("--resume", is_flag=True, default=False, help="Resume from last checkpoint.")
-@click.option("--workers", default=4, type=int, help="Max parallel Claude workers (Stage 3).")
-def run(project_dir: str, mode: str, resume: bool, workers: int):
+def run(project_dir: str, resume: bool):
     """Run the full RTL design pipeline."""
     project_dir = Path(project_dir).resolve()
 
@@ -61,7 +58,6 @@ def run(project_dir: str, mode: str, resume: bool, workers: int):
     # Show startup info
     console.print(Panel(
             f"[bold]VeriFlow-Agent[/] v0.1.0\n"
-            f"Mode: {mode}\n"
             f"Project: {project_dir.name}",
             title="RTL Design Pipeline",
         ))
@@ -71,11 +67,11 @@ def run(project_dir: str, mode: str, resume: bool, workers: int):
         state = _load_checkpoint(project_dir)
         if state is None:
             console.print("[yellow]No checkpoint found, starting fresh.")
-            state = create_initial_state(str(project_dir), mode=mode)
+            state = create_initial_state(str(project_dir))
         else:
             console.print("[green]Resuming from checkpoint.")
     else:
-        state = create_initial_state(str(project_dir), mode=mode)
+        state = create_initial_state(str(project_dir))
 
     # Build and run the graph
     graph = create_veriflow_graph(with_checkpointer=True)
@@ -149,7 +145,7 @@ def _stage_number_to_name(stage: int) -> Optional[str]:
     """Convert stage number to internal name."""
     mapping = {
         1: "architect", 15: "microarch", 2: "timing",
-        3: "coder", 35: "skill_d", 4: "sim_loop", 5: "synth",
+        3: "coder", 35: "skill_d", 4: "sim", 5: "synth",
     }
     return mapping.get(stage)
 
@@ -286,7 +282,7 @@ def _display_results(result: dict) -> None:
     table.add_column("Artifacts")
     table.add_column("Time", justify="right")
 
-    for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"]:
+    for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "lint", "sim", "synth", "debugger"]:
         output = result.get(f"{stage_name}_output")
         if output:
             success = _safe_get(output, "success", False)
@@ -294,7 +290,7 @@ def _display_results(result: dict) -> None:
             artifacts_list = _safe_get(output, "artifacts", []) or []
             artifacts = ", ".join(artifacts_list) if artifacts_list else "-"
             dur_s = _safe_get(output, "duration_s", 0.0)
-            time_str = f"{dur:.1f}s" if dur_s > 0 else "-"
+            time_str = f"{dur_s:.1f}s" if dur_s > 0 else "-"
             table.add_row(stage_name, status, artifacts, time_str)
 
         else:
@@ -317,7 +313,7 @@ def _display_results(result: dict) -> None:
     # Show timing summary
     total_duration = 0.0
     stage_times = []
-    for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"]:
+    for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "lint", "sim", "synth", "debugger"]:
         output = result.get(f"{stage_name}_output")
         if output:
             dur = _safe_get(output, "duration_s", 0.0)
@@ -377,6 +373,23 @@ def ui(port: int, host: str):
     except subprocess.CalledProcessError as e:
         console.print(f"[red]UI failed with exit code {e.returncode}")
         sys.exit(1)
+
+
+@cli.command()
+@click.option("--host", default="0.0.0.0", help="Host to bind the chat server to.")
+@click.option("--port", default=7860, help="Port to run the chat server on.")
+@click.option("--share", is_flag=True, default=False, help="Create a public Gradio share URL.")
+def chat(host: str, port: int, share: bool):
+    """Launch the interactive Chat UI for VeriFlow-Agent."""
+    from veriflow_agent.chat import launch_chat
+
+    console.print("[green]Starting VeriFlow-Agent Chat UI...")
+    console.print(f"[dim]URL: http://localhost:{port}")
+    if share:
+        console.print("[dim]Public share URL will be generated.")
+    console.print("")
+
+    launch_chat(host=host, port=port, share=share)
 
 
 def main():

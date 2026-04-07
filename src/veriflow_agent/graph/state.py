@@ -1,13 +1,193 @@
 """State definitions for VeriFlow LangGraph.
 
 This module defines the TypedDict state structure used by the LangGraph
-state machine, including per-stage outputs and execution metadata.
+state machine, including per-stage outputs, error categorization,
+multi-level rollback targeting, and token budget tracking.
 """
 
+from __future__ import annotations
+
+import logging
+import re
+from enum import Enum
 from typing import Annotated, Any, Optional, Sequence, TypedDict
 from dataclasses import dataclass, field
 
 from langgraph.graph import add_messages
+
+logger = logging.getLogger("veriflow")
+
+
+# ── Error categorization for multi-level rollback ────────────────────────
+
+
+class ErrorCategory(str, Enum):
+    """Classification of RTL errors for rollback target selection.
+
+    SYNTAX:    Compile/lint errors (missing semicolons, typos, undeclared wires)
+    LOGIC:     Functional/simulation failures (wrong outputs, assertion violations)
+    TIMING:    Synthesis timing violations (setup/hold, clock skew)
+    RESOURCE:  Synthesis resource overflows (area, power, cell count exceeds target)
+    UNKNOWN:   Unclassifiable errors → conservative full rollback to lint
+    """
+    SYNTAX = "syntax"
+    LOGIC = "logic"
+    TIMING = "timing"
+    RESOURCE = "resource"
+    UNKNOWN = "unknown"
+
+
+# Keyword patterns for error classification
+_SYNTAX_PATTERNS = [
+    r"syntax\s+error",
+    r"unexpected\s+token",
+    r"undeclared\s+identifier",
+    r"unknown\s+port",
+    r"port\s+width\s+mismatch",
+    r"missing\s+semicolon",
+    r"error:\s*\d+",                # generic compiler error with line number
+    r"iverilog.*error",
+    r"compilation\s+failed",
+]
+
+_LOGIC_PATTERNS = [
+    r"simulation\s+fail",
+    r"mismatch",
+    r"assertion\s+(fail|violation)",
+    r"wrong\s+(output|result|value)",
+    r"timeout",
+    r"VVP.*F",
+    r"testbench.*fail",
+    r"expected.*got",
+]
+
+_TIMING_PATTERNS = [
+    r"timing\s+violation",
+    r"setup\s+(time|violation|check)",
+    r"hold\s+(time|violation|check)",
+    r"clock\s+skew",
+    r"slack.*negative",
+    r"max\s+frequency",
+    r"critical\s+path",
+    r"met\s*.*unmet",
+]
+
+_RESOURCE_PATTERNS = [
+    r"area\s+(exceeds|over|limit)",
+    r"cell\s+count\s+(exceeds|over)",
+    r"resource\s+(exceeds|over|limit)",
+    r"power\s+(exceeds|over|limit)",
+    r"LUT\s+\w*\s*(exceeds|over)",
+    r"FF\s+\w*\s*(exceeds|over)",
+    r"BRAM\s+\w*\s*(exceeds|over)",
+    r"DSP\s+\w*\s*(exceeds|over)",
+]
+
+
+def categorize_error(error_messages: list[str]) -> ErrorCategory:
+    """Classify errors by scanning error messages against keyword patterns.
+
+    Args:
+        error_messages: List of error strings from the failed check.
+
+    Returns:
+        The most specific ErrorCategory found, or UNKNOWN if no match.
+    """
+    combined = "\n".join(error_messages).lower()
+
+    for pattern in _TIMING_PATTERNS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return ErrorCategory.TIMING
+
+    for pattern in _RESOURCE_PATTERNS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return ErrorCategory.RESOURCE
+
+    for pattern in _SYNTAX_PATTERNS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return ErrorCategory.SYNTAX
+
+    for pattern in _LOGIC_PATTERNS:
+        if re.search(pattern, combined, re.IGNORECASE):
+            return ErrorCategory.LOGIC
+
+    return ErrorCategory.UNKNOWN
+
+
+def get_rollback_target(
+    error_category: ErrorCategory,
+    feedback_source: str,
+) -> str:
+    """Determine the rollback target stage based on error category and source.
+
+    Rollback strategy:
+    - SYNTAX errors: Roll back to coder (code generation issue)
+    - LOGIC errors:
+        - From sim → microarch (design/architecture issue)
+        - From lint/synth → coder (code generation issue)
+    - TIMING/RESOURCE errors:
+        - From synth → timing (timing model needs revision)
+        - From lint/sim → coder (code didn't follow timing model)
+    - UNKNOWN → lint (conservative full rollback)
+    - skill_d failures → coder (quality pre-check, no EDA involved)
+
+    Args:
+        error_category: Classified error type.
+        feedback_source: Which check triggered the failure
+                         ("lint"/"sim"/"synth"/"skill_d").
+
+    Returns:
+        Target stage name for rollback ("coder", "microarch", "timing", "lint").
+    """
+    # SkillD quality gate always rolls back to coder
+    if feedback_source == "skill_d":
+        return "coder"
+
+    if error_category == ErrorCategory.SYNTAX:
+        return "coder"
+
+    if error_category == ErrorCategory.LOGIC:
+        if feedback_source == "sim":
+            return "microarch"
+        return "coder"
+
+    if error_category in (ErrorCategory.TIMING, ErrorCategory.RESOURCE):
+        if feedback_source == "synth":
+            return "timing"
+        return "coder"
+
+    # UNKNOWN → conservative full rollback
+    return "lint"
+
+
+# ── Token budget ─────────────────────────────────────────────────────────
+
+DEFAULT_TOKEN_BUDGET = 1_000_000  # 1M tokens default budget
+
+
+def check_token_budget(state: VeriFlowState) -> tuple[bool, str]:
+    """Check if token usage is within budget.
+
+    Args:
+        state: Current pipeline state.
+
+    Returns:
+        Tuple of (is_within_budget, message).
+        is_within_budget is False only when budget is exceeded (>100%).
+        Message is "" when under 80%, a warning at 80-100%, or an error above 100%.
+    """
+    budget = state.get("token_budget", DEFAULT_TOKEN_BUDGET)
+    usage = state.get("token_usage", 0)
+
+    if budget <= 0:
+        return True, ""
+
+    ratio = usage / budget
+    if ratio >= 1.0:
+        return False, f"Token budget exceeded: {usage}/{budget} ({ratio:.0%})"
+    if ratio >= 0.8:
+        return True, f"Token budget warning: {usage}/{budget} ({ratio:.0%})"
+    return True, ""
 
 
 @dataclass
@@ -57,25 +237,49 @@ class StageOutput:
         )
 
 
+# Maximum retry attempts per check point (lint, sim, synth)
+MAX_RETRIES = 3
+
+
 class VeriFlowState(TypedDict):
     """Complete state for the VeriFlow LangGraph.
 
-    This state is passed between nodes in the graph and persisted
-    across checkpoints for resume capability.
+    Single pipeline mode — all stages always execute.
+    Multi-level rollback — debugger routes to different targets based on error category.
 
     Attributes:
         # Project Configuration
         project_dir: Root directory of the project
-        mode: Pipeline mode (quick/standard/enterprise)
 
         # Execution State
         current_stage: Name of currently executing stage
         stages_completed: List of successfully completed stages
         stages_failed: List of stages that failed
-        retry_count: Per-stage retry attempt counter
+        retry_count: Per-check-point retry counter (lint/sim/synth)
+        error_history: Per-check-point accumulated error messages
+        feedback_source: Which check point triggered the debugger
+                         ("lint" / "sim" / "synth" / "")
+
+        # Multi-level Rollback
+        error_categories: Per-check-point classified error category
+        target_rollback_stage: Where debugger should route after fixing
+                               ("coder" / "microarch" / "timing" / "lint")
+
+        # Token Budget
+        token_budget: Total token budget for this pipeline run
+        token_usage: Accumulated token usage so far
+        token_usage_by_stage: Per-stage token usage breakdown
 
         # Stage Outputs
-        X_output: StageOutput for each stage X
+        architect_output: StageOutput
+        microarch_output: StageOutput
+        timing_output: StageOutput
+        coder_output: StageOutput
+        skill_d_output: StageOutput
+        lint_output: StageOutput
+        sim_output: StageOutput
+        synth_output: StageOutput
+        debugger_output: StageOutput
 
         # Quality Gates
         quality_gates_passed: Map of gate name to pass/fail
@@ -86,13 +290,23 @@ class VeriFlowState(TypedDict):
 
     # Project Configuration
     project_dir: str
-    mode: str  # "quick" | "standard" | "enterprise"
 
     # Execution State
     current_stage: str
-    stages_completed: Annotated[list[str], lambda x, y: list(set(x + y))]
+    stages_completed: Annotated[list[str], lambda x, y: list(dict.fromkeys(x + y))]
     stages_failed: list[str]
     retry_count: dict[str, int]
+    error_history: dict[str, list[str]]
+    feedback_source: str  # "lint" | "sim" | "synth" | ""
+
+    # Multi-level Rollback
+    error_categories: dict[str, str]         # checkpoint → ErrorCategory value
+    target_rollback_stage: str               # "coder" | "microarch" | "timing" | "lint"
+
+    # Token Budget
+    token_budget: int
+    token_usage: int
+    token_usage_by_stage: dict[str, int]
 
     # Stage Outputs
     architect_output: Optional[StageOutput]
@@ -100,8 +314,10 @@ class VeriFlowState(TypedDict):
     timing_output: Optional[StageOutput]
     coder_output: Optional[StageOutput]
     skill_d_output: Optional[StageOutput]
-    debugger_output: Optional[StageOutput]
+    lint_output: Optional[StageOutput]
+    sim_output: Optional[StageOutput]
     synth_output: Optional[StageOutput]
+    debugger_output: Optional[StageOutput]
 
     # Quality Gates
     quality_gates_passed: dict[str, bool]
@@ -112,58 +328,51 @@ class VeriFlowState(TypedDict):
 
 def create_initial_state(
     project_dir: str,
-    mode: str = "standard",
-    resume: bool = False
+    token_budget: int = DEFAULT_TOKEN_BUDGET,
 ) -> VeriFlowState:
     """Create initial state for a new pipeline run.
 
     Args:
         project_dir: Path to the project directory
-        mode: Pipeline mode (quick/standard/enterprise)
-        resume: Whether to resume from a previous checkpoint
+        token_budget: Total token budget for the pipeline run
 
     Returns:
         Initial VeriFlowState with default values
     """
     return VeriFlowState(
         project_dir=project_dir,
-        mode=mode,
         current_stage="",
         stages_completed=[],
         stages_failed=[],
         retry_count={
-            "architect": 0,
-            "microarch": 0,
-            "timing": 0,
-            "coder": 0,
-            "skill_d": 0,
-            "sim_loop": 0,
+            "lint": 0,
+            "sim": 0,
             "synth": 0,
         },
+        error_history={
+            "lint": [],
+            "sim": [],
+            "synth": [],
+        },
+        feedback_source="",
+        error_categories={
+            "lint": "",
+            "sim": "",
+            "synth": "",
+        },
+        target_rollback_stage="lint",
+        token_budget=token_budget,
+        token_usage=0,
+        token_usage_by_stage={},
         architect_output=None,
         microarch_output=None,
         timing_output=None,
         coder_output=None,
         skill_d_output=None,
-        debugger_output=None,
+        lint_output=None,
+        sim_output=None,
         synth_output=None,
+        debugger_output=None,
         quality_gates_passed={},
         messages=[],
     )
-
-
-def get_mode_stages(mode: str) -> list[str]:
-    """Get the list of stages for a given pipeline mode.
-
-    Args:
-        mode: Pipeline mode (quick/standard/enterprise)
-
-    Returns:
-        List of stage names in execution order
-    """
-    stages_map = {
-        "quick": ["architect", "microarch", "coder", "skill_d"],
-        "standard": ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"],
-        "enterprise": ["architect", "microarch", "timing", "coder", "skill_d", "sim_loop", "synth"],
-    }
-    return stages_map.get(mode, stages_map["standard"])

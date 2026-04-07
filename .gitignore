@@ -41,6 +41,7 @@ htmlcov/
 
 # Project specific
 .veriflow/
+workspace/
 *.log
 *.out
 *.vcd

@@ -12,6 +12,8 @@ from veriflow_agent.agents.timing import TimingAgent
 from veriflow_agent.agents.coder import CoderAgent
 from veriflow_agent.agents.skill_d import SkillDAgent
 from veriflow_agent.agents.debugger import DebuggerAgent
+from veriflow_agent.agents.lint_agent import LintAgent
+from veriflow_agent.agents.sim_agent import SimAgent
 from veriflow_agent.agents.synth import SynthAgent
 
 __all__ = [
@@ -23,5 +25,7 @@ __all__ = [
     "CoderAgent",
     "SkillDAgent",
     "DebuggerAgent",
+    "LintAgent",
+    "SimAgent",
     "SynthAgent",
 ]

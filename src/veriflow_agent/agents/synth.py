@@ -12,6 +12,7 @@ from typing import Any
 
 from veriflow_agent.agents.base import AgentResult, BaseAgent
 from veriflow_agent.tools.synth import YosysTool
+from veriflow_agent.tools.constraint_gen import generate_constraints, read_constraint_file
 
 
 class SynthAgent(BaseAgent):
@@ -92,6 +93,23 @@ class SynthAgent(BaseAgent):
                 errors=["No RTL files found in workspace/rtl/"],
             )
 
+        # Step 3.5: Generate constraints from timing model (if available)
+        constraint_path = project_dir / "workspace" / "docs" / "synth_constraints.sdc"
+        timing_yaml = project_dir / "workspace" / "docs" / "timing_model.yaml"
+        constraint_warnings = []
+
+        if timing_yaml.exists():
+            constraint_result = generate_constraints(
+                timing_model_path=str(timing_yaml),
+                output_path=str(constraint_path),
+                target_kpis=target_kpis,
+            )
+            if constraint_result.success:
+                constraint_warnings = constraint_result.warnings
+            else:
+                constraint_warnings = constraint_result.warnings
+        # If no timing model, skip constraint generation (not an error)
+
         # Step 4: Run Yosys
         tool = YosysTool()
         if not tool.validate_prerequisites():
@@ -120,6 +138,7 @@ class SynthAgent(BaseAgent):
             "num_wires": synth_result.num_wires,
             "target_kpis": target_kpis,
             "area_utilization": {},
+            "constraints": str(constraint_path) if constraint_path.exists() else None,
             "raw_output": synth_result.raw_stats[:2000],
         }
 

@@ -22,6 +22,8 @@ from veriflow_agent.agents.timing import TimingAgent
 from veriflow_agent.agents.coder import CoderAgent
 from veriflow_agent.agents.skill_d import SkillDAgent
 from veriflow_agent.agents.debugger import DebuggerAgent
+from veriflow_agent.agents.lint_agent import LintAgent
+from veriflow_agent.agents.sim_agent import SimAgent
 from veriflow_agent.agents.synth import SynthAgent
 
 
@@ -89,10 +91,11 @@ class TestAgentInstantiation:
     def test_all_agents_instantiate(self):
         agents = [
             ArchitectAgent(), MicroArchAgent(), TimingAgent(),
-            CoderAgent(), SkillDAgent(), DebuggerAgent(), SynthAgent(),
+            CoderAgent(), SkillDAgent(), DebuggerAgent(),
+            LintAgent(), SimAgent(), SynthAgent(),
         ]
         names = {a.name for a in agents}
-        assert names == {"architect", "microarch", "timing", "coder", "skill_d", "debugger", "synth"}
+        assert names == {"architect", "microarch", "timing", "coder", "skill_d", "debugger", "lint", "sim", "synth"}
 
     def test_agent_configs(self):
         a = ArchitectAgent()
@@ -271,7 +274,69 @@ class TestSynthAgent:
 
 class TestSkillDAgent:
     def test_execute_no_rtl(self, tmp_project):
+        """SkillDAgent should fail when no RTL files exist."""
         agent = SkillDAgent()
         ctx = {"project_dir": str(tmp_project)}
         result = agent.execute(ctx)
         assert result.success is False
+
+    def test_execute_with_rtl_passes_quality(self, tmp_project):
+        """SkillDAgent should pass quality gate with well-structured RTL."""
+        rtl_dir = tmp_project / "workspace" / "rtl"
+        rtl_dir.mkdir(parents=True, exist_ok=True)
+        (rtl_dir / "alu.v").write_text(
+            "module alu(\n"
+            "    input wire clk,\n"
+            "    input wire rst_n,\n"
+            "    input wire [7:0] a,\n"
+            "    input wire [7:0] b,\n"
+            "    output reg [15:0] result\n"
+            ");\n"
+            "always @(posedge clk or negedge rst_n) begin\n"
+            "    if (!rst_n)\n"
+            "        result <= 16'd0;\n"
+            "    else\n"
+            "        result <= a * b;\n"
+            "end\n"
+            "endmodule\n"
+        )
+
+        agent = SkillDAgent(quality_threshold=0.3)
+        ctx = {"project_dir": str(tmp_project)}
+        result = agent.execute(ctx)
+        assert result.stage == "skill_d"
+        assert "quality_score" in result.metrics
+
+    def test_quality_threshold_configurable(self):
+        """SkillD should accept custom quality threshold."""
+        agent = SkillDAgent(quality_threshold=0.9)
+        assert agent.quality_threshold == 0.9
+
+    def test_static_score_with_issues(self, tmp_project):
+        """Static analysis should detect naming violations."""
+        rtl_dir = tmp_project / "workspace" / "rtl"
+        rtl_dir.mkdir(parents=True, exist_ok=True)
+        (rtl_dir / "BadModule.v").write_text(
+            "module BadModule(input clk); endmodule\n"
+        )
+
+        agent = SkillDAgent()
+        rtl_files = list(rtl_dir.glob("*.v"))
+        analysis = agent._run_static_analysis(rtl_files)
+        assert len(analysis["issues"]) > 0
+
+    def test_parse_llm_score(self):
+        """Should parse LLM output correctly."""
+        agent = SkillDAgent()
+        output = "SCORE: 85\nISSUES:\n- latch inferred in module foo\n- missing reset\n"
+        score, issues = agent._parse_llm_score(output)
+        assert score == 0.85
+        assert len(issues) == 2
+
+    def test_parse_llm_score_no_issues(self):
+        """Should handle clean output."""
+        agent = SkillDAgent()
+        output = "SCORE: 95\nISSUES:\n"
+        score, issues = agent._parse_llm_score(output)
+        assert score == 0.95
+        assert len(issues) == 0

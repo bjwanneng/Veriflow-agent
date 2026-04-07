@@ -68,51 +68,9 @@ elif project_dir:
 
 st.divider()
 
-# Pipeline mode selection
-st.subheader("⚙️ 流水线模式")
-
-mode_col1, mode_col2, mode_col3 = st.columns(3)
-
-with mode_col1:
-    if st.button("🚀 快速模式", use_container_width=True,
-                 help="跳过 timing 和 sim_loop 阶段，适合快速原型"):
-        st.session_state["pipeline_mode"] = "quick"
-
-with mode_col2:
-    if st.button("⚖️ 标准模式", use_container_width=True,
-                 help="运行全部 7 个阶段，推荐用于正式设计"):
-        st.session_state["pipeline_mode"] = "standard"
-
-with mode_col3:
-    if st.button("🏢 企业模式", use_container_width=True,
-                 help="严格质量门控，适合生产级设计"):
-        st.session_state["pipeline_mode"] = "enterprise"
-
-current_mode = st.session_state.get("pipeline_mode", "standard")
-
-mode_descriptions = {
-    "quick": {
-        "icon": "🚀",
-        "name": "快速模式",
-        "stages": "architect → microarch → coder → skill_d",
-        "description": "跳过 timing 和 sim_loop，适合快速验证架构可行性",
-    },
-    "standard": {
-        "icon": "⚖️",
-        "name": "标准模式",
-        "stages": "全部 7 个阶段",
-        "description": "完整的 RTL 设计流程，从架构到综合",
-    },
-    "enterprise": {
-        "icon": "🏢",
-        "name": "企业模式",
-        "stages": "全部 7 个阶段 + 严格门控",
-        "description": "严格的质量检查，适合生产级设计",
-    },
-}
-
-selected = mode_descriptions[current_mode]
-st.info(f"**当前选择: {selected['icon']} {selected['name']}**  —  {selected['stages']} | {selected['description']}")
+# Pipeline flow info
+st.subheader("⚙️ 流水线流程")
+st.info("**完整 RTL 设计流程**  — architect → microarch → timing → coder → skill_d → lint → sim → synth | 含 lint/sim/synth 反馈回路")
 
 st.divider()
 
@@ -138,7 +96,7 @@ else:
         if st.button("▶️ 运行流水线", type="primary", use_container_width=True):
             st.switch_page("pages/02_▶️_pipeline_execution.py")
     with col_status:
-        st.success(f"✅ 项目配置完成，模式: {current_mode}")
+        st.success("✅ 项目配置完成")
         st.markdown(f"- 📁 项目: `{project_dir}`")
-        st.markdown(f"- 📝 requirement.md: 存在")
-        st.markdown(f"- ⚙️ 模式: {current_mode}")
+        st.markdown("- 📝 requirement.md: 存在")
+        st.markdown("- ⚙️ 流程: 全阶段执行（含反馈回路）")

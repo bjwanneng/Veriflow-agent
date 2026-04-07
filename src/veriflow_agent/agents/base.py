@@ -241,14 +241,19 @@ class BaseAgent(ABC):
 
     def _resolve_prompt_path(self) -> Path:
         """Resolve prompt file path with CWD and package fallback."""
+        # Attempt 1: CWD-relative (useful during development)
         prompt_path = Path("prompts") / self.prompt_file
         if prompt_path.exists() and prompt_path.is_file():
             return prompt_path
-        # Fallback: relative to package source
-        pkg_prompt = Path(__file__).resolve().parent.parent.parent / "prompts" / self.prompt_file
+        # Attempt 2: Package-relative (works in pip-installed packages)
+        # __file__ = .../veriflow_agent/agents/base.py → parent.parent = .../veriflow_agent/
+        pkg_prompt = Path(__file__).resolve().parent.parent / "prompts" / self.prompt_file
         if pkg_prompt.exists() and pkg_prompt.is_file():
             return pkg_prompt
-        raise LLMInvocationError(f"Prompt file not found: {self.prompt_file}")
+        raise LLMInvocationError(
+            f"Prompt file not found: {self.prompt_file} "
+            f"(tried CWD 'prompts/' and package-relative)"
+        )
 
     def render_prompt(self, context: dict[str, Any]) -> str:
         """Read the prompt file and substitute {{KEY}} placeholders.
@@ -289,6 +294,9 @@ class BaseAgent(ABC):
         - "anthropic": Use Anthropic Python SDK
         - "langchain": Use LangChain abstraction
 
+        After each call, estimated token usage is stored in self._last_token_usage
+        for retrieval by the caller (typically via get_last_token_usage()).
+
         Args:
             context: Execution context with prompt variables
             prompt_override: Optional override for the prompt file content
@@ -300,6 +308,7 @@ class BaseAgent(ABC):
         Raises:
             LLMInvocationError: If the LLM call fails
         """
+        self._last_token_usage = 0
         if self.llm_backend == "claude_cli":
             return self._call_llm_claude_cli(context, prompt_override, system_prompt)
         elif self.llm_backend == "anthropic":
@@ -309,6 +318,25 @@ class BaseAgent(ABC):
         else:
             raise LLMInvocationError(f"Unknown LLM backend: {self.llm_backend}")
 
+    def get_last_token_usage(self) -> int:
+        """Get the estimated token usage from the most recent LLM call.
+
+        Returns:
+            Estimated token count (0 if no call made yet).
+        """
+        return getattr(self, "_last_token_usage", 0)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Rough token estimate: ~4 chars per token for English/code.
+
+        Args:
+            text: Text to estimate token count for.
+
+        Returns:
+            Estimated token count.
+        """
+        return max(1, len(text) // 4)
+
     def _call_llm_claude_cli(
         self,
         context: dict[str, Any],
@@ -316,9 +344,6 @@ class BaseAgent(ABC):
         system_prompt: str | None = None,
     ) -> str:
         """Call LLM using Claude CLI subprocess (backward compatible)."""
-        import json
-        import subprocess
-
         # Find claude CLI
         claude_exe = self._find_claude_cli()
         if not claude_exe:
@@ -328,26 +353,18 @@ class BaseAgent(ABC):
         if prompt_override:
             prompt_content = prompt_override
         else:
-            prompt_path = Path("prompts") / self.prompt_file
-            if not prompt_path.exists():
-                raise LLMInvocationError(f"Prompt file not found: {prompt_path}")
+            prompt_path = self._resolve_prompt_path()
             prompt_content = prompt_path.read_text(encoding="utf-8")
 
         # Prepend system prompt if provided
         if system_prompt:
             prompt_content = f"{system_prompt}\n\n{prompt_content}"
 
-        # Prepare stdin data
-        stdin_data = {
-            "prompt": prompt_content,
-            "context": context,
-        }
-
         # Call Claude CLI
         try:
             result = subprocess.run(
                 [claude_exe, "--print", "--dangerously-skip-permissions"],
-                input=json.dumps(stdin_data).encode("utf-8"),
+                input=prompt_content.encode("utf-8"),
                 capture_output=True,
                 timeout=600,  # 10 minute timeout
             )
@@ -358,6 +375,9 @@ class BaseAgent(ABC):
                 raise LLMInvocationError(
                     f"Claude CLI failed with code {result.returncode}: {stderr}"
                 )
+
+            # Estimate token usage
+            self._last_token_usage = self._estimate_tokens(prompt_content) + self._estimate_tokens(stdout)
 
             return stdout
 
@@ -396,12 +416,23 @@ class BaseAgent(ABC):
         # Call API
         try:
             message = client.messages.create(
-                model="claude-3-sonnet-20240229",  # Configurable
+                model=os.environ.get("VERIFLOW_MODEL", "claude-sonnet-4-6"),
                 max_tokens=4096,
                 temperature=0.1,
                 system=system_prompt if system_prompt else None,
                 messages=[{"role": "user", "content": prompt_content}],
             )
+            # Track token usage from API response
+            if hasattr(message, "usage") and message.usage:
+                self._last_token_usage = (
+                    getattr(message.usage, "input_tokens", 0)
+                    + getattr(message.usage, "output_tokens", 0)
+                )
+            else:
+                self._last_token_usage = (
+                    self._estimate_tokens(prompt_content)
+                    + self._estimate_tokens(message.content[0].text)
+                )
             return message.content[0].text
         except Exception as e:
             raise LLMInvocationError(f"Anthropic API call failed: {e}")
@@ -423,7 +454,7 @@ class BaseAgent(ABC):
 
         # Initialize model
         model = ChatAnthropic(
-            model="claude-3-sonnet-20240229",
+            model=os.environ.get("VERIFLOW_MODEL", "claude-sonnet-4-6"),
             temperature=0.1,
             max_tokens=4096,
         )
@@ -445,6 +476,14 @@ class BaseAgent(ABC):
         chain = prompt | model
         try:
             result = chain.invoke(context)
+            # Track token usage from LangChain response metadata
+            token_count = 0
+            if hasattr(result, "response_metadata"):
+                usage = result.response_metadata.get("usage", {})
+                token_count = usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+            if token_count == 0:
+                token_count = self._estimate_tokens(prompt_content) + self._estimate_tokens(result.content)
+            self._last_token_usage = token_count
             return result.content
         except Exception as e:
             raise LLMInvocationError(f"LangChain invocation failed: {e}")

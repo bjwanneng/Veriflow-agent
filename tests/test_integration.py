@@ -2,10 +2,10 @@
 
 Tests the full pipeline flow with mock LLM:
 - Checkpoint save/restore
-- Conditional routing (quick vs standard mode)
 - EDA tool execution on sample project
 - Stage node execution with real files
 - Spec validation
+- Retry tracking and error history
 """
 
 import json
@@ -17,6 +17,7 @@ from veriflow_agent.graph.state import (
     VeriFlowState,
     StageOutput,
     create_initial_state,
+    MAX_RETRIES,
 )
 from veriflow_agent.graph.graph import (
     create_veriflow_graph,
@@ -24,8 +25,6 @@ from veriflow_agent.graph.graph import (
     node_architect,
     node_coder,
     node_synth,
-    _route_after_microarch,
-    _route_after_skill_d,
 )
 from veriflow_agent.agents.base import AgentResult
 from veriflow_agent.agents.architect import ArchitectAgent
@@ -34,7 +33,6 @@ from veriflow_agent.agents.synth import SynthAgent
 from veriflow_agent.tools.lint import IverilogTool
 from veriflow_agent.tools.simulate import VvpTool
 from veriflow_agent.tools.synth import YosysTool
-from langgraph.graph import END
 
 from veriflow_agent.cli import (
     _load_checkpoint,
@@ -49,7 +47,6 @@ from veriflow_agent.cli import (
 
 class TestCheckpointPersistence:
     def test_save_and_load(self, tmp_path):
-        """Test that checkpoints can be saved and loaded."""
         state = {"stages_completed": ["architect"], "current_stage": "microarch"}
         _save_checkpoint(tmp_path, state)
 
@@ -59,12 +56,10 @@ class TestCheckpointPersistence:
         assert loaded["current_stage"] == "microarch"
 
     def test_load_nonexistent(self, tmp_path):
-        """Test loading from nonexistent checkpoint returns None."""
         loaded = _load_checkpoint(tmp_path)
         assert loaded is None
 
     def test_overwrite_checkpoint(self, tmp_path):
-        """Test that saving twice overwrites."""
         state1 = {"stages_completed": ["architect"]}
         _save_checkpoint(tmp_path, state1)
 
@@ -85,7 +80,7 @@ class TestStageMapping:
         assert _stage_number_to_name(2) == "timing"
         assert _stage_number_to_name(3) == "coder"
         assert _stage_number_to_name(35) == "skill_d"
-        assert _stage_number_to_name(4) == "sim_loop"
+        assert _stage_number_to_name(4) == "sim"
         assert _stage_number_to_name(5) == "synth"
         assert _stage_number_to_name(99) is None
 
@@ -162,21 +157,28 @@ class TestEDAToolsIntegration:
         assert isinstance(result, bool)
 
 
-# ── Graph routing with real state ──────────────────────────────────────
+# ── State initialization ────────────────────────────────────────────────
 
 
-class TestGraphRoutingIntegration:
-    def test_quick_mode_skips_stages(self):
-        """Quick mode should route around timing and sim_loop."""
-        state = create_initial_state("/tmp/test", mode="quick")
-        assert _route_after_microarch(state) == "coder"
-        assert _route_after_skill_d(state) == END
+class TestStateInitialization:
+    def test_initial_state_has_all_fields(self):
+        state = create_initial_state("/tmp/test")
+        assert "project_dir" in state
+        assert "retry_count" in state
+        assert "error_history" in state
+        assert "feedback_source" in state
+        assert state["feedback_source"] == ""
+        assert "error_categories" in state
+        assert "target_rollback_stage" in state
+        assert "token_budget" in state
+        assert "token_usage" in state
+        assert "token_usage_by_stage" in state
 
-    def test_standard_mode_includes_all(self):
-        """Standard mode should route through all stages."""
-        state = create_initial_state("/tmp/test", mode="standard")
-        assert _route_after_microarch(state) == "timing"
-        assert _route_after_skill_d(state) == "sim_loop"
+    def test_initial_retry_counts_zero(self):
+        state = create_initial_state("/tmp/test")
+        assert state["retry_count"]["lint"] == 0
+        assert state["retry_count"]["sim"] == 0
+        assert state["retry_count"]["synth"] == 0
 
 
 # ── Full pipeline with mock LLM ───────────────────────────────────────
@@ -186,7 +188,7 @@ class TestPipelineWithMockLLM:
     def test_architect_agent_on_sample(self, sample_project_dir, spec_data):
         """Architect agent should work with sample project inputs."""
         agent = ArchitectAgent()
-        ctx = {"project_dir": sample_project_dir, "mode": "standard"}
+        ctx = {"project_dir": sample_project_dir}
         valid, missing = agent.validate_inputs(ctx)
         assert valid
 

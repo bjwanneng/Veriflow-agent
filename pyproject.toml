@@ -24,6 +24,7 @@ dependencies = [
     "rich>=13.0",
     "streamlit>=1.28.0",
     "watchdog>=3.0",
+    "gradio>=4.0",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +41,9 @@ veriflow-agent = "veriflow_agent.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+veriflow_agent = ["prompts/*.md"]
 
 [tool.ruff]
 target-version = "py310"

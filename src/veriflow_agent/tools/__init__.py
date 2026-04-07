@@ -8,6 +8,7 @@ from veriflow_agent.tools.base import BaseTool, ToolResult, ToolError
 from veriflow_agent.tools.lint import IverilogTool, LintResult
 from veriflow_agent.tools.simulate import VvpTool, SimResult
 from veriflow_agent.tools.synth import YosysTool, SynthResult
+from veriflow_agent.tools.constraint_gen import generate_constraints, read_constraint_file
 
 __all__ = [
     "BaseTool",
@@ -19,4 +20,6 @@ __all__ = [
     "SimResult",
     "YosysTool",
     "SynthResult",
+    "generate_constraints",
+    "read_constraint_file",
 ]

@@ -1,17 +1,31 @@
 """LangGraph graph assembly for VeriFlow-Agent.
 
-Defines the complete RTL design pipeline as a LangGraph StateGraph:
-  architect → microarch → [timing] → coder → skill_d → [sim_loop] → [synth] → END
+Defines the complete RTL design pipeline as a LangGraph StateGraph with
+declarative feedback loops and multi-level rollback:
 
-Supports three modes:
-  - quick:      architect → microarch → coder → skill_d
-  - standard:   all stages
-  - enterprise: all stages (with stricter quality gates)
+  architect → microarch → timing → coder → skill_d → lint
+                                                      ↓
+                          ┌───────────────────────────┘
+                          │
+                          ├─(pass)→ sim
+                          │           ↓
+                          │      (pass)→ synth
+                          │                ↓
+                          │           (pass)→ END
+                          │
+                          ├─(fail, retry<3)→ debugger ──┐
+                          └─(fail, retry≥3)→ END        │
+                                                        │
+                          ┌─────────────────────────────┘
+                          │ rollback target (multi-level):
+                          │   SYNTAX error  → coder
+                          │   LOGIC error   → microarch (from sim) / coder
+                          │   TIMING error  → timing (from synth) / coder
+                          │   RESOURCE error→ timing (from synth) / coder
+                          │   UNKNOWN       → lint (conservative)
 
-The graph uses:
-  - Conditional edges for mode-based routing and quality gates
-  - MemorySaver checkpointing for resume capability
-  - VeriFlowState as the shared state between nodes
+All feedback is implemented via LangGraph conditional edges, not inline loops.
+Debugger is a proper graph node tracked by checkpointing.
 """
 
 from __future__ import annotations
@@ -28,7 +42,11 @@ from veriflow_agent.graph.state import (
     VeriFlowState,
     StageOutput,
     create_initial_state,
-    get_mode_stages,
+    MAX_RETRIES,
+    ErrorCategory,
+    categorize_error,
+    get_rollback_target,
+    check_token_budget,
 )
 from veriflow_agent.agents.architect import ArchitectAgent
 from veriflow_agent.agents.microarch import MicroArchAgent
@@ -36,9 +54,9 @@ from veriflow_agent.agents.timing import TimingAgent
 from veriflow_agent.agents.coder import CoderAgent
 from veriflow_agent.agents.skill_d import SkillDAgent
 from veriflow_agent.agents.debugger import DebuggerAgent
+from veriflow_agent.agents.lint_agent import LintAgent
+from veriflow_agent.agents.sim_agent import SimAgent
 from veriflow_agent.agents.synth import SynthAgent
-from veriflow_agent.tools.lint import IverilogTool
-from veriflow_agent.tools.simulate import VvpTool
 
 logger = logging.getLogger("veriflow")
 
@@ -64,7 +82,6 @@ def _run_stage(
     agent = agent_cls()
     context = {
         "project_dir": state.get("project_dir", "."),
-        "mode": state.get("mode", "standard"),
         **extra_ctx,
     }
 
@@ -90,7 +107,6 @@ def _run_stage(
     # Record stage completion/failure
     completed = list(state.get("stages_completed", []))
     failed = list(state.get("stages_failed", []))
-    retry_count = dict(state.get("retry_count", {}))
 
     if result.success:
         if stage_name not in completed:
@@ -100,9 +116,6 @@ def _run_stage(
         if stage_name not in failed:
             failed.append(stage_name)
         updates["stages_failed"] = failed
-        # Increment retry counter
-        retry_count[stage_name] = retry_count.get(stage_name, 0) + 1
-        updates["retry_count"] = retry_count
 
     # Store stage output
     stage_output = StageOutput(
@@ -121,7 +134,19 @@ def _run_stage(
     quality_gates[stage_name] = result.success
     updates["quality_gates_passed"] = quality_gates
 
+    # Token tracking
+    tokens_used = result.metrics.get("token_usage", 0)
+    if tokens_used > 0:
+        current_usage = state.get("token_usage", 0)
+        usage_by_stage = dict(state.get("token_usage_by_stage", {}))
+        usage_by_stage[stage_name] = usage_by_stage.get(stage_name, 0) + tokens_used
+        updates["token_usage"] = current_usage + tokens_used
+        updates["token_usage_by_stage"] = usage_by_stage
+
     return updates
+
+
+# ── LLM-based stage nodes ─────────────────────────────────────────────
 
 
 def node_architect(state: VeriFlowState) -> dict[str, Any]:
@@ -145,180 +170,151 @@ def node_coder(state: VeriFlowState) -> dict[str, Any]:
 
 
 def node_skill_d(state: VeriFlowState) -> dict[str, Any]:
-    """Stage 3.5: Static analysis + internal lint loop.
+    """Stage 3.5: Quality gatekeeper — LLM pre-check on RTL code.
 
-    Runs iverilog lint. On failure, invokes the Debugger and retries,
-    up to max_retries iterations.
+    Returns success=False if quality score is below threshold,
+    which routes to debugger instead of expensive iverilog/Yosys.
     """
-    project_dir = Path(state.get("project_dir", "."))
-    max_retries = 5
+    return _run_stage(state, SkillDAgent)
 
-    # Run static analysis first
-    updates = _run_stage(state, SkillDAgent)
 
-    # Also run iverilog lint with retry loop
-    lint_tool = IverilogTool()
-    if lint_tool.validate_prerequisites():
-        rtl_dir = project_dir / "workspace" / "rtl"
-        if rtl_dir.exists():
-            rtl_files = list(rtl_dir.glob("*.v"))
-            non_tb = IverilogTool.filter_testbench_files(rtl_files)
+# ── EDA check nodes (no LLM) ──────────────────────────────────────────
 
-            if non_tb:
-                for attempt in range(max_retries):
-                    lint_result = lint_tool.run(
-                        mode="lint",
-                        files=non_tb,
-                        cwd=project_dir,
-                    )
-                    parsed = lint_tool.parse_lint_output(lint_result)
 
-                    if parsed.passed:
-                        # Update skill_d output to reflect lint pass
-                        quality_gates = dict(state.get("quality_gates_passed", {}))
-                        quality_gates["skill_d_lint"] = True
-                        updates["quality_gates_passed"] = quality_gates
-                        break
+def node_lint(state: VeriFlowState) -> dict[str, Any]:
+    """Lint check: run iverilog on RTL files.
 
-                    # Lint failed → invoke debugger
-                    debugger = DebuggerAgent()
-                    dbg_ctx = {
-                        "project_dir": str(project_dir),
-                        "mode": state.get("mode", "standard"),
-                        "error_type": "lint",
-                        "error_log": (lint_result.stdout or "") + (lint_result.stderr or ""),
-                        "rtl_files": [str(f) for f in non_tb],
-                    }
-                    try:
-                        debugger.execute(dbg_ctx)
-                    except Exception:
-                        pass
+    On failure, increments retry counter, records error history,
+    categorizes the error, and determines the rollback target.
+    """
+    updates = _run_stage(state, LintAgent)
 
-                    # Refresh file list (debugger may have changed files)
-                    non_tb = IverilogTool.filter_testbench_files(list(rtl_dir.glob("*.v")))
+    lint_output: StageOutput | None = updates.get("lint_output")
+    if lint_output and not lint_output.success:
+        # Increment retry counter
+        retry_count = dict(state.get("retry_count", {}))
+        retry_count["lint"] = retry_count.get("lint", 0) + 1
+        updates["retry_count"] = retry_count
 
-                    # If this was the last attempt, record lint failure
-                    if attempt == max_retries - 1:
-                        quality_gates = dict(state.get("quality_gates_passed", {}))
-                        quality_gates["skill_d_lint"] = False
-                        updates["quality_gates_passed"] = quality_gates
+        # Record error history
+        error_history = dict(state.get("error_history", {}))
+        lint_errors = list(error_history.get("lint", []))
+        lint_errors.append("\n".join(lint_output.errors))
+        error_history["lint"] = lint_errors
+        updates["error_history"] = error_history
+
+        # Classify error and set rollback target
+        category = categorize_error(lint_output.errors)
+        error_categories = dict(state.get("error_categories", {}))
+        error_categories["lint"] = category.value
+        updates["error_categories"] = error_categories
+        updates["target_rollback_stage"] = get_rollback_target(category, "lint")
+        logger.info("Lint error categorized as %s → rollback to %s",
+                     category.value, updates["target_rollback_stage"])
 
     return updates
 
 
-def node_sim_loop(state: VeriFlowState) -> dict[str, Any]:
-    """Stage 4: Simulation verification loop.
+def node_sim(state: VeriFlowState) -> dict[str, Any]:
+    """Simulation check: run iverilog + vvp on all testbenches.
 
-    Compiles and runs testbench, retries with debugger on failure.
+    On failure, increments retry counter, records error history,
+    categorizes the error, and determines the rollback target.
     """
-    project_dir = Path(state.get("project_dir", "."))
-    max_retries = 5
+    updates = _run_stage(state, SimAgent)
 
-    sim_tool = VvpTool()
-    if not sim_tool.validate_prerequisites():
-        return {"current_stage": "sim_loop"}
+    sim_output: StageOutput | None = updates.get("sim_output")
+    if sim_output and not sim_output.success:
+        retry_count = dict(state.get("retry_count", {}))
+        retry_count["sim"] = retry_count.get("sim", 0) + 1
+        updates["retry_count"] = retry_count
 
-    # Discover files
-    rtl_dir = project_dir / "workspace" / "rtl"
-    tb_dir = project_dir / "workspace" / "tb"
+        error_history = dict(state.get("error_history", {}))
+        sim_errors = list(error_history.get("sim", []))
+        sim_errors.append("\n".join(sim_output.errors))
+        error_history["sim"] = sim_errors
+        updates["error_history"] = error_history
 
-    rtl_files = list(rtl_dir.glob("*.v")) if rtl_dir.exists() else []
-    tb_files = list(tb_dir.glob("tb_*.v")) if tb_dir.exists() else []
+        # Classify error and set rollback target
+        category = categorize_error(sim_output.errors)
+        error_categories = dict(state.get("error_categories", {}))
+        error_categories["sim"] = category.value
+        updates["error_categories"] = error_categories
+        updates["target_rollback_stage"] = get_rollback_target(category, "sim")
+        logger.info("Sim error categorized as %s → rollback to %s",
+                     category.value, updates["target_rollback_stage"])
 
-    if not rtl_files or not tb_files:
-        return {
-            "current_stage": "sim_loop",
-            "stages_failed": list(state.get("stages_failed", [])) + ["sim_loop"],
-        }
-
-    for attempt in range(max_retries):
-        for tb in tb_files:
-            sim_result = sim_tool.run(
-                testbench=tb,
-                rtl_files=rtl_files,
-                cwd=project_dir,
-            )
-            parsed = sim_tool.parse_sim_output(sim_result)
-
-            if parsed.passed:
-                completed = list(state.get("stages_completed", []))
-                if "sim_loop" not in completed:
-                    completed.append("sim_loop")
-                return {
-                    "current_stage": "sim_loop",
-                    "stages_completed": completed,
-                    "quality_gates_passed": {
-                        **state.get("quality_gates_passed", {}),
-                        "sim_loop": True,
-                    },
-                }
-
-            # Sim failed → invoke debugger
-            debugger = DebuggerAgent()
-            dbg_ctx = {
-                "project_dir": str(project_dir),
-                "mode": state.get("mode", "standard"),
-                "error_type": "sim",
-                "error_log": parsed.output[:5000],
-                "rtl_files": [str(f) for f in rtl_files],
-                "timing_model_yaml": str(project_dir / "workspace" / "docs" / "timing_model.yaml"),
-            }
-            try:
-                debugger.execute(dbg_ctx)
-            except Exception:
-                pass
-
-            # Refresh file list
-            rtl_files = list(rtl_dir.glob("*.v"))
-
-    # Exhausted retries
-    return {
-        "current_stage": "sim_loop",
-        "stages_failed": list(state.get("stages_failed", [])) + ["sim_loop"],
-        "quality_gates_passed": {
-            **state.get("quality_gates_passed", {}),
-            "sim_loop": False,
-        },
-    }
+    return updates
 
 
 def node_synth(state: VeriFlowState) -> dict[str, Any]:
-    """Stage 5: Synthesis + KPI comparison."""
-    return _run_stage(state, SynthAgent)
+    """Synthesis check: run Yosys on RTL files.
+
+    On failure, increments retry counter, records error history,
+    categorizes the error, and determines the rollback target.
+    """
+    updates = _run_stage(state, SynthAgent)
+
+    synth_output: StageOutput | None = updates.get("synth_output")
+    if synth_output and not synth_output.success:
+        retry_count = dict(state.get("retry_count", {}))
+        retry_count["synth"] = retry_count.get("synth", 0) + 1
+        updates["retry_count"] = retry_count
+
+        error_history = dict(state.get("error_history", {}))
+        synth_errors = list(error_history.get("synth", []))
+        synth_errors.append("\n".join(synth_output.errors))
+        error_history["synth"] = synth_errors
+        updates["error_history"] = error_history
+
+        # Classify error and set rollback target
+        category = categorize_error(synth_output.errors)
+        error_categories = dict(state.get("error_categories", {}))
+        error_categories["synth"] = category.value
+        updates["error_categories"] = error_categories
+        updates["target_rollback_stage"] = get_rollback_target(category, "synth")
+        logger.info("Synth error categorized as %s → rollback to %s",
+                     category.value, updates["target_rollback_stage"])
+
+    return updates
 
 
-# ── Routing functions ─────────────────────────────────────────────────
+# ── Debugger node ──────────────────────────────────────────────────────
 
 
-def _route_after_microarch(
-    state: VeriFlowState,
-) -> Literal["timing", "coder"]:
-    """Route after microarch: timing only in standard/enterprise mode."""
-    mode = state.get("mode", "standard")
-    stages = get_mode_stages(mode)
+def node_debugger(state: VeriFlowState) -> dict[str, Any]:
+    """Debugger: invoke LLM to fix RTL based on accumulated error context.
 
-    if "timing" in stages:
-        return "timing"
-    return "coder"
+    Reads feedback_source from state to know which check triggered this.
+    Passes error history to LLM for accumulated context.
+    """
+    feedback_source = state.get("feedback_source", "lint")
 
+    # Gather current error log from the triggering check's output
+    error_log = ""
+    stage_output_key = f"{feedback_source}_output"
+    stage_output = state.get(stage_output_key)
+    if stage_output:
+        error_log = "\n".join(stage_output.errors) if stage_output.errors else ""
 
-def _route_after_skill_d(
-    state: VeriFlowState,
-) -> Literal["sim_loop", "__end__"]:
-    """Route after skill_d: sim_loop in standard/enterprise, else END."""
-    mode = state.get("mode", "standard")
-    stages = get_mode_stages(mode)
+    # Gather error history for this check point
+    error_history_map = state.get("error_history", {})
+    error_history = list(error_history_map.get(feedback_source, []))
 
-    if "sim_loop" in stages or "debugger" in stages:
-        return "sim_loop"
-    return END
+    project_dir = Path(state.get("project_dir", "."))
+    timing_yaml = str(project_dir / "workspace" / "docs" / "timing_model.yaml")
 
+    debugger_ctx = {
+        "project_dir": str(project_dir),
+        "error_type": feedback_source,
+        "error_log": error_log[:5000],
+        "feedback_source": feedback_source,
+        "error_history": error_history,
+        "timing_model_yaml": timing_yaml,
+    }
 
-def _route_after_synth(
-    state: VeriFlowState,
-) -> Literal["__end__"]:
-    """Synth is always the last stage."""
-    return END
+    updates = _run_stage(state, DebuggerAgent, **debugger_ctx)
+    return updates
 
 
 # ── Graph builder ─────────────────────────────────────────────────────
@@ -330,8 +326,23 @@ def create_veriflow_graph(
 ) -> StateGraph:
     """Build the VeriFlow LangGraph pipeline.
 
-    Creates a StateGraph with all 7 pipeline stages as nodes,
-    connected by conditional edges for mode-based routing.
+    Pipeline flow:
+      architect → microarch → timing → coder → skill_d → lint
+                                                            ↓
+      ┌─────────────────────────────────────────────────────┘
+      │
+      ├─(pass)→ sim ─(pass)→ synth ─(pass)→ END
+      │           │               │
+      │           └─(fail)→ debugger ──→ target_rollback_stage
+      │                           │
+      └───────────────────────────┘
+
+    Multi-level rollback targets:
+      SYNTAX  → coder      (code generation fix)
+      LOGIC   → microarch  (design/arch fix, from sim) / coder
+      TIMING  → timing     (timing model fix, from synth) / coder
+      RESOURCE→ timing     (constraint fix, from synth) / coder
+      UNKNOWN → lint       (conservative full rollback)
 
     Args:
         with_checkpointer: Whether to compile with MemorySaver for
@@ -339,37 +350,125 @@ def create_veriflow_graph(
 
     Returns:
         Compiled StateGraph ready for invoke/stream.
-
-    Example:
-        graph = create_veriflow_graph()
-        result = graph.invoke(
-            create_initial_state(project_dir="/path/to/project", mode="standard")
-        )
     """
     builder = StateGraph(VeriFlowState)
 
-    # Add nodes
+    # ── Add nodes ──────────────────────────────────────────────────
     builder.add_node("architect", node_architect)
     builder.add_node("microarch", node_microarch)
     builder.add_node("timing", node_timing)
     builder.add_node("coder", node_coder)
     builder.add_node("skill_d", node_skill_d)
-    builder.add_node("sim_loop", node_sim_loop)
+    builder.add_node("lint", node_lint)
+    builder.add_node("sim", node_sim)
     builder.add_node("synth", node_synth)
+    builder.add_node("debugger", node_debugger)
 
-    # Fixed edges: linear pipeline segments
+    # ── Linear edges (always-executed stages) ──────────────────────
     builder.add_edge(START, "architect")
     builder.add_edge("architect", "microarch")
+    builder.add_edge("microarch", "timing")
     builder.add_edge("timing", "coder")
     builder.add_edge("coder", "skill_d")
-    builder.add_edge("sim_loop", "synth")
-    builder.add_edge("synth", END)
 
-    # Conditional edges
-    builder.add_conditional_edges("microarch", _route_after_microarch)
-    builder.add_conditional_edges("skill_d", _route_after_skill_d)
+    # ── skill_d conditional edge (quality gate) ─────────────────────
+    # pass → lint (proceed to EDA checks)
+    # fail → debugger (low quality, fix before expensive EDA)
+    def _route_skill_d(state: VeriFlowState) -> str:
+        skill_d_output = state.get("skill_d_output")
+        if skill_d_output and skill_d_output.success:
+            return "lint"
 
-    # Compile
+        # Check token budget before retrying
+        within_budget, msg = check_token_budget(state)
+        if not within_budget:
+            logger.error("Token budget exceeded at skill_d: %s", msg)
+            return END
+
+        logger.info("SkillD quality gate failed, routing to debugger")
+        state["feedback_source"] = "skill_d"
+        return "debugger"
+
+    builder.add_conditional_edges("skill_d", _route_skill_d)
+
+    # ── Conditional edges (quality gates + token budget) ────────────
+
+    # After lint: pass → sim, fail → debugger or END
+    def _route_lint(state: VeriFlowState) -> str:
+        lint_output = state.get("lint_output")
+        if lint_output and lint_output.success:
+            return "sim"
+
+        # Check token budget before retrying
+        within_budget, msg = check_token_budget(state)
+        if not within_budget:
+            logger.error("Token budget exceeded at lint: %s", msg)
+            return END
+
+        retry_count = state.get("retry_count", {})
+        lint_retries = retry_count.get("lint", 0)
+        if lint_retries < MAX_RETRIES:
+            logger.info("Lint failed (attempt %d/%d), routing to debugger", lint_retries, MAX_RETRIES)
+            state["feedback_source"] = "lint"
+            return "debugger"
+        return END
+
+    builder.add_conditional_edges("lint", _route_lint)
+
+    # After sim: pass → synth, fail → debugger or END
+    def _route_sim(state: VeriFlowState) -> str:
+        sim_output = state.get("sim_output")
+        if sim_output and sim_output.success:
+            return "synth"
+
+        # Check token budget before retrying
+        within_budget, msg = check_token_budget(state)
+        if not within_budget:
+            logger.error("Token budget exceeded at sim: %s", msg)
+            return END
+
+        retry_count = state.get("retry_count", {})
+        sim_retries = retry_count.get("sim", 0)
+        if sim_retries < MAX_RETRIES:
+            logger.info("Sim failed (attempt %d/%d), routing to debugger", sim_retries, MAX_RETRIES)
+            state["feedback_source"] = "sim"
+            return "debugger"
+        return END
+
+    builder.add_conditional_edges("sim", _route_sim)
+
+    # After synth: pass → END, fail → debugger or END
+    def _route_synth(state: VeriFlowState) -> str:
+        synth_output = state.get("synth_output")
+        if synth_output and synth_output.success:
+            logger.info("Synthesis passed! Pipeline complete.")
+            return END
+
+        # Check token budget before retrying
+        within_budget, msg = check_token_budget(state)
+        if not within_budget:
+            logger.error("Token budget exceeded at synth: %s", msg)
+            return END
+
+        retry_count = state.get("retry_count", {})
+        synth_retries = retry_count.get("synth", 0)
+        if synth_retries < MAX_RETRIES:
+            logger.info("Synth failed (attempt %d/%d), routing to debugger", synth_retries, MAX_RETRIES)
+            state["feedback_source"] = "synth"
+            return "debugger"
+        return END
+
+    builder.add_conditional_edges("synth", _route_synth)
+
+    # Debugger → target_rollback_stage (multi-level rollback)
+    def _route_debugger(state: VeriFlowState) -> str:
+        target = state.get("target_rollback_stage", "lint")
+        logger.info("Debugger routing to rollback target: %s", target)
+        return target
+
+    builder.add_conditional_edges("debugger", _route_debugger)
+
+    # ── Compile ────────────────────────────────────────────────────
     checkpointer = MemorySaver() if with_checkpointer else None
     graph = builder.compile(
         checkpointer=checkpointer,

@@ -1,7 +1,6 @@
 """Pipeline Execution page - run RTL design stages with progress tracking."""
 
 import json
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -10,198 +9,230 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent))
 
+from veriflow_agent.ui.components.feedback_loop_viz import render_feedback_loop_viz
+from veriflow_agent.ui.components.error_history_timeline import render_error_history_timeline
+from veriflow_agent.ui.components.debugger_status_panel import render_debugger_status_panel
+
 st.set_page_config(page_title="Pipeline Execution - VeriFlow-Agent", page_icon="▶️")
 
-st.title("▶️ 流水线执行")
-st.markdown("运行 RTL 设计流程的各个阶段")
+# Raw Terminal Aesthetic CSS
+st.markdown("""
+<style>
+/* Global Raw Terminal Aesthetic */
+.stApp {
+    background: linear-gradient(135deg, #0d1117 0%, #161b22 100%);
+}
 
-st.divider()
+.main .block-container {
+    background: transparent;
+    max-width: 1400px;
+    padding: 2rem;
+}
 
-# Check if project is configured
-if "project_dir" not in st.session_state or not st.session_state["project_dir"]:
-    st.error("❌ 请先配置项目目录")
-    st.button("📁 前往项目设置", on_click=lambda: st.switch_page("pages/01_🏠_project_setup.py"))
-    st.stop()
+/* Headers */
+h1, h2, h3 {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace !important;
+    color: #00d4ff !important;
+    text-transform: uppercase;
+    letter-spacing: 2px;
+}
 
-project_dir = st.session_state["project_dir"]
-mode = st.session_state.get("pipeline_mode", "standard")
+h1 {
+    font-size: 18px !important;
+    border-bottom: 2px solid #00d4ff;
+    padding-bottom: 10px;
+}
 
-# Validate project
-if not Path(project_dir).exists():
-    st.error(f"❌ 项目目录不存在: {project_dir}")
-    st.stop()
+h2 {
+    font-size: 14px !important;
+    border-bottom: 1px solid #30363d;
+    padding-bottom: 8px;
+}
 
-if not (Path(project_dir) / "requirement.md").exists():
-    st.warning("⚠️ 缺少 requirement.md")
+h3 {
+    font-size: 12px !important;
+}
 
-# Initialize session state for execution tracking
-if "execution_state" not in st.session_state:
-    st.session_state["execution_state"] = {
-        "running": False,
-        "current_stage": None,
-        "completed_stages": [],
-        "failed_stages": [],
-        "logs": [],
-        "results": {},
-    }
+/* Text and markdown */
+p, span, div {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+}
 
-exec_state = st.session_state["execution_state"]
+/* Buttons */
+.stButton > button {
+    background: linear-gradient(135deg, #1f6feb 0%, #388bfd 100%);
+    color: white;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    border: none;
+    border-radius: 4px;
+    padding: 8px 16px;
+    transition: all 0.2s ease;
+}
 
-# Stage definitions
-STAGES = [
-    {"num": 1, "name": "architect", "display": "🏗️ Architect", "output": "spec.json"},
-    {"num": 1.5, "name": "microarch", "display": "📐 MicroArch", "output": "micro_arch.md"},
-    {"num": 2, "name": "timing", "display": "⏱️ Timing", "output": "timing_model.yaml"},
-    {"num": 3, "name": "coder", "display": "💻 Coder", "output": "*.v"},
-    {"num": 3.5, "name": "skill_d", "display": "🔍 Skill D", "output": "lint report"},
-    {"num": 4, "name": "sim_loop", "display": "🧪 Sim Loop", "output": "sim results"},
-    {"num": 5, "name": "synth", "display": "🔧 Synthesis", "output": "synth_report.json"},
-]
+.stButton > button:hover {
+    background: linear-gradient(135deg, #388bfd 0%, #58a6ff 100%);
+    box-shadow: 0 0 15px rgba(56, 139, 253, 0.4);
+    transform: translateY(-1px);
+}
 
-# Filter stages based on mode
-if mode == "quick":
-    ACTIVE_STAGES = [s for s in STAGES if s["name"] not in ["timing", "sim_loop"]]
-else:
-    ACTIVE_STAGES = STAGES
+.stButton > button:active {
+    transform: translateY(0);
+}
 
-# UI Layout
-col_left, col_right = st.columns([1, 2])
+/* Primary button variant */
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #238636 0%, #2ea043 100%);
+}
 
-with col_left:
-    st.subheader("📋 执行控制")
+.stButton > button[kind="primary"]:hover {
+    background: linear-gradient(135deg, #2ea043 0%, #3fb950 100%);
+    box-shadow: 0 0 15px rgba(46, 160, 67, 0.4);
+}
 
-    st.markdown(f"**项目:** `{Path(project_dir).name}`")
-    st.markdown(f"**模式:** `{mode}`")
-    st.markdown(f"**阶段数:** {len(ACTIVE_STAGES)}")
+/* Info boxes */
+.stAlert {
+    background: rgba(31, 111, 235, 0.1);
+    border: 1px solid rgba(31, 111, 235, 0.3);
+    border-radius: 6px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11px;
+}
 
-    st.divider()
+.stAlert[data-baseweb="notification"] {
+    background: rgba(31, 111, 235, 0.1);
+}
 
-    # Execution controls
-    if not exec_state["running"] and not exec_state["completed_stages"]:
-        if st.button("▶️ 开始执行", type="primary", use_container_width=True):
-            exec_state["running"] = True
-            exec_state["current_stage"] = ACTIVE_STAGES[0]["name"]
-            st.rerun()
+/* Error/Warning/Success variants */
+.element-container .stAlert:nth-child(1) {
+    border-color: #ff4444;
+    background: rgba(255, 68, 68, 0.1);
+}
 
-    elif exec_state["running"]:
-        st.info(f"⏳ 正在执行: {exec_state['current_stage']}")
-        if st.button("⏸️ 停止", use_container_width=True):
-            exec_state["running"] = False
-            st.rerun()
+.element-container .stAlert:nth-child(2) {
+    border-color: #ffd700;
+    background: rgba(255, 215, 0, 0.1);
+}
 
-    elif exec_state["completed_stages"]:
-        if st.button("🔄 重新执行", use_container_width=True):
-            exec_state["running"] = True
-            exec_state["current_stage"] = ACTIVE_STAGES[0]["name"]
-            exec_state["completed_stages"] = []
-            exec_state["failed_stages"] = []
-            exec_state["logs"] = []
-            st.rerun()
+.element-container .stAlert:nth-child(3) {
+    border-color: #00ff88;
+    background: rgba(0, 255, 136, 0.1);
+}
 
-    st.divider()
+/* Expander/Details */
+.streamlit-expanderHeader {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11px;
+    color: #888888;
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    padding: 8px 12px;
+}
 
-    # Checkpoint management
-    checkpoint_path = Path(project_dir) / ".veriflow" / "checkpoint.json"
-    if checkpoint_path.exists():
-        st.info(f"💾 存在检查点")
-        if st.button("🗑️ 清除检查点", use_container_width=True):
-            checkpoint_path.unlink()
-            st.success("检查点已清除")
-            st.rerun()
+.streamlit-expanderContent {
+    background: rgba(0, 0, 0, 0.1);
+    border: 1px solid #30363d;
+    border-top: none;
+    border-radius: 0 0 4px 4px;
+    padding: 12px;
+}
 
-with col_right:
-    st.subheader("📊 执行状态")
+/* Progress bars */
+.stProgress > div > div {
+    background: linear-gradient(90deg, #238636 0%, #2ea043 100%);
+    border-radius: 2px;
+}
 
-    # Stage progress bars
-    for stage in ACTIVE_STAGES:
-        stage_name = stage["name"]
-        display = stage["display"]
+.stProgress > div {
+    background: #30363d;
+    border-radius: 2px;
+}
 
-        col_status, col_bar = st.columns([1, 3])
+/* Text inputs and selects */
+.stTextInput > div > div > input,
+.stSelectbox > div > div > select {
+    background: #0d1117;
+    border: 1px solid #30363d;
+    border-radius: 4px;
+    color: #e6edf3;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 11px;
+    padding: 8px 12px;
+}
 
-        with col_status:
-            if stage_name in exec_state["failed_stages"]:
-                st.error(f"{display} ❌")
-            elif stage_name in exec_state["completed_stages"]:
-                st.success(f"{display} ✅")
-            elif stage_name == exec_state.get("current_stage"):
-                st.info(f"{display} ⏳")
-            else:
-                st.markdown(f"{display} ⏸️")
+.stTextInput > div > div > input:focus,
+.stSelectbox > div > div > select:focus {
+    border-color: #58a6ff;
+    box-shadow: 0 0 0 3px rgba(88, 166, 255, 0.1);
+}
 
-        with col_bar:
-            if stage_name in exec_state["completed_stages"]:
-                st.progress(100)
-            elif stage_name == exec_state.get("current_stage"):
-                # Simulated progress
-                import random
-                                progress = random.randint(20, 80)
-                st.progress(progress)
-            else:
-                st.progress(0)
+/* Dividers */
+hr {
+    border: none;
+    border-top: 1px solid #30363d;
+    margin: 20px 0;
+}
 
-    # Execution log
-    with st.expander("📜 执行日志", expanded=False):
-        if exec_state["logs"]:
-            for log in exec_state["logs"]:
-                st.text(log)
-        else:
-            st.markdown("*暂无日志*")
+/* Scrollbars */
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
 
-    # Quick actions for completed stages
-    if exec_state["completed_stages"]:
-        st.divider()
-        st.subheader("🔍 快速查看")
+::-webkit-scrollbar-track {
+    background: #0d1117;
+}
 
-        cols = st.columns(4)
-        with cols[0]:
-            if "architect" in exec_state["completed_stages"]:
-                if st.button("📄 查看 spec.json"):
-                    spec_path = Path(project_dir) / "workspace" / "docs" / "spec.json"
-                    if spec_path.exists():
-                        st.json(json.loads(spec_path.read_text()))
-        with cols[1]:
-            if "coder" in exec_state["completed_stages"]:
-                if st.button("💻 查看 RTL"):
-                    rtl_dir = Path(project_dir) / "workspace" / "rtl"
-                    if rtl_dir.exists():
-                        files = list(rtl_dir.glob("*.v"))
-                        st.markdown(f"**RTL 文件 ({len(files)}):**")
-                        for f in files:
-                            st.markdown(f"- `{f.name}`")
-        with cols[2]:
-            if "synth" in exec_state["completed_stages"]:
-                if st.button("📊 查看综合报告"):
-                    report_path = Path(project_dir) / "workspace" / "docs" / "synth_report.json"
-                    if report_path.exists():
-                        st.json(json.loads(report_path.read_text()))
+::-webkit-scrollbar-thumb {
+    background: #30363d;
+    border-radius: 4px;
+}
 
-# Simulate execution progress (for demo purposes)
-if exec_state["running"] and exec_state["current_stage"]:
-    # In real implementation, this would execute the actual pipeline
-    import time
+::-webkit-scrollbar-thumb:hover {
+    background: #484f58;
+}
+</style>
+""", unsafe_allow_html=True)
 
-    current = exec_state["current_stage"]
-    active_names = [s["name"] for s in ACTIVE_STAGES]
+    # Render the feedback loop visualization
+    render_feedback_loop_viz(
+        current_stage=current_stage,
+        completed_stages=completed_stages,
+        failed_stages=failed_stages,
+        retry_counts=retry_counts,
+        feedback_source=feedback_source
+    )
 
-    if current in active_names:
-        idx = active_names.index(current)
+    # Render error history if in retry loop
+    if feedback_source and current_stage in ["debugger", feedback_source]:
+        # Get error history from session state
+        exec_state = st.session_state.get("execution_state", {})
+        error_history = exec_state.get("error_history", {}).get(feedback_source, [])
+        current_retry = retry_counts.get(feedback_source, 0)
 
-        # Simulate stage completion after delay
-        time.sleep(0.5)  # Demo delay
+        render_error_history_timeline(
+            error_history=error_history,
+            checkpoint_name=feedback_source,
+            current_attempt=current_retry + 1 if current_stage == "debugger" else current_retry,
+            max_attempts=3
+        )
 
-        # Mark current as completed
-        if current not in exec_state["completed_stages"]:
-            exec_state["completed_stages"].append(current)
-            exec_state["logs"].append(f"✅ {current} completed")
+    # Render debugger status panel
+    files_analyzed = []  # Could be passed from debugger agent
+    debugger_logs = ""  # Could be passed from debugger agent
 
-        # Move to next stage or finish
-        if idx + 1 < len(active_names):
-            exec_state["current_stage"] = active_names[idx + 1]
-            exec_state["logs"].append(f"⏳ Starting {active_names[idx + 1]}...")
-            st.rerun()
-        else:
-            exec_state["running"] = False
-            exec_state["current_stage"] = None
-            exec_state["logs"].append("🎉 Pipeline completed!")
-            st.rerun()
+    render_debugger_status_panel(
+        current_stage=current_stage,
+        feedback_source=feedback_source,
+        retry_counts=retry_counts,
+        debugger_output=debugger_logs,
+        files_being_analyzed=files_analyzed,
+        llm_backend="claude_cli"
+    )
+
+
+# Wrapper function for easy import
+__all__ = ['render_pipeline_viz']

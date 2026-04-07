@@ -1,17 +1,22 @@
 """Shared EDA tool discovery and environment utilities.
 
 Extracted from the original veriflow_ctl.py to provide consistent tool
-discovery and environment setup across all EDA tool wrappers.
+discovery, environment setup, and version detection across all EDA tool wrappers.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
+import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger("veriflow")
 
 
 def find_eda_tool(tool_name: str) -> Optional[str]:
@@ -121,3 +126,155 @@ def _find_oss_cad_suite() -> Optional[Path]:
         if bin_dir.exists():
             return bin_dir.parent
     return None
+
+
+# ── Version detection ───────────────────────────────────────────────────
+
+
+# Known version flags and parse patterns for each tool
+_TOOL_VERSION_CONFIG: dict[str, dict[str, str]] = {
+    "iverilog": {
+        "flag": "-V",
+        "pattern": r"Icarus Verilog version\s+(\S+)",
+    },
+    "vvp": {
+        "flag": "-V",
+        "pattern": r"Icarus Verilog runtime version\s+(\S+)",
+    },
+    "yosys": {
+        "flag": "--version",
+        "pattern": r"Yosys\s+(\S+)",
+    },
+}
+
+# Minimum recommended versions (None = no minimum)
+_MIN_VERSIONS: dict[str, str] = {
+    "iverilog": "10.0",
+    "yosys": "0.9",
+}
+
+
+def get_tool_version(tool_name: str) -> Optional[str]:
+    """Detect the version of an EDA tool.
+
+    Args:
+        tool_name: Tool executable name (e.g. "iverilog", "yosys", "vvp").
+
+    Returns:
+        Version string (e.g. "11.0", "0.23"), or None if detection fails.
+    """
+    tool_path = find_eda_tool(tool_name)
+    if not tool_path:
+        return None
+
+    config = _TOOL_VERSION_CONFIG.get(tool_name)
+    if not config:
+        # Generic fallback: try --version
+        return _try_generic_version(tool_path)
+
+    flag = config["flag"]
+    pattern = config["pattern"]
+
+    try:
+        result = subprocess.run(
+            [tool_path, flag],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            env=get_eda_env(),
+        )
+        output = (result.stdout or "") + (result.stderr or "")
+        match = re.search(pattern, output)
+        if match:
+            return match.group(1)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        logger.debug("Version detection failed for %s: %s", tool_name, e)
+
+    return None
+
+
+def _try_generic_version(tool_path: str) -> Optional[str]:
+    """Fallback version detection using --version flag."""
+    for flag in ["--version", "-V", "-v"]:
+        try:
+            result = subprocess.run(
+                [tool_path, flag],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                env=get_eda_env(),
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            # Try to find a version-like pattern (x.y.z or x.y)
+            match = re.search(r'(\d+\.\d+(?:\.\d+)?)', output)
+            if match:
+                return match.group(1)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+    return None
+
+
+def get_all_tool_versions() -> dict[str, Optional[str]]:
+    """Detect versions of all known EDA tools.
+
+    Returns:
+        Dict mapping tool name to version string (or None if not found).
+    """
+    versions = {}
+    for tool_name in _TOOL_VERSION_CONFIG:
+        versions[tool_name] = get_tool_version(tool_name)
+    return versions
+
+
+def check_version_compatibility(tool_name: str) -> tuple[bool, str]:
+    """Check if a tool's version meets minimum requirements.
+
+    Args:
+        tool_name: Tool executable name.
+
+    Returns:
+        Tuple of (is_compatible, message).
+        is_compatible is True if version is sufficient or no minimum set.
+        Message describes the result or issue.
+    """
+    min_version = _MIN_VERSIONS.get(tool_name)
+    if not min_version:
+        return True, ""
+
+    version = get_tool_version(tool_name)
+    if not version:
+        return True, f"Version unknown for {tool_name} (no check applied)"
+
+    if _compare_versions(version, min_version) >= 0:
+        return True, f"{tool_name} {version} >= {min_version}"
+    else:
+        return False, f"{tool_name} {version} < minimum {min_version}"
+
+
+def _compare_versions(v1: str, v2: str) -> int:
+    """Compare two version strings. Returns -1, 0, or 1.
+
+    Handles formats like "11.0", "0.23", "10.3.1".
+    """
+    def parse(v: str) -> list[int]:
+        parts = []
+        for p in v.split("."):
+            try:
+                parts.append(int(p))
+            except ValueError:
+                break
+        return parts
+
+    a = parse(v1)
+    b = parse(v2)
+    # Pad shorter list with zeros
+    max_len = max(len(a), len(b))
+    a.extend([0] * (max_len - len(a)))
+    b.extend([0] * (max_len - len(b)))
+
+    for x, y in zip(a, b):
+        if x < y:
+            return -1
+        if x > y:
+            return 1
+    return 0

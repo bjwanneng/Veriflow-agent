@@ -12,10 +12,17 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from veriflow_agent.tools.base import BaseTool, ToolResult, ToolStatus
-from veriflow_agent.tools.eda_utils import find_eda_tool, get_eda_env
+from veriflow_agent.tools.eda_utils import (
+    find_eda_tool, get_eda_env,
+    get_tool_version, get_all_tool_versions,
+    check_version_compatibility, _compare_versions,
+)
 from veriflow_agent.tools.lint import IverilogTool, LintResult
 from veriflow_agent.tools.simulate import VvpTool, SimResult
 from veriflow_agent.tools.synth import YosysTool, SynthResult
+from veriflow_agent.tools.constraint_gen import (
+    generate_constraints, read_constraint_file,
+)
 
 
 # ── Base classes ──────────────────────────────────────────────────────
@@ -209,3 +216,145 @@ class TestEdaUtils:
         env = get_eda_env()
         assert isinstance(env, dict)
         assert "PATH" in env
+
+
+# ── Version detection ─────────────────────────────────────────────────
+
+
+class TestVersionDetection:
+    def test_get_tool_version_returns_str_or_none(self):
+        version = get_tool_version("iverilog")
+        assert version is None or isinstance(version, str)
+
+    def test_get_all_tool_versions(self):
+        versions = get_all_tool_versions()
+        assert isinstance(versions, dict)
+        assert "iverilog" in versions
+        assert "yosys" in versions
+        assert "vvp" in versions
+
+    def test_compare_versions_equal(self):
+        assert _compare_versions("10.0", "10.0") == 0
+
+    def test_compare_versions_greater(self):
+        assert _compare_versions("11.0", "10.0") == 1
+        assert _compare_versions("10.1", "10.0") == 1
+
+    def test_compare_versions_less(self):
+        assert _compare_versions("9.0", "10.0") == -1
+
+    def test_compare_versions_three_part(self):
+        assert _compare_versions("10.3.1", "10.3.0") == 1
+        assert _compare_versions("10.3.1", "10.3") == 1
+
+    def test_check_version_compatibility_unknown_tool(self):
+        ok, msg = check_version_compatibility("nonexistent_tool")
+        assert ok is True  # No minimum set → always OK
+
+    def test_get_tool_version_nonexistent(self):
+        version = get_tool_version("definitely_not_a_tool_xyz")
+        assert version is None
+
+
+# ── Constraint generation ─────────────────────────────────────────────
+
+
+class TestConstraintGeneration:
+    def test_generate_from_clocks_list(self, tmp_path):
+        """Generate constraints from timing model with clock list."""
+        import yaml
+        timing = {
+            "clocks": [
+                {"name": "clk", "period_ns": 10.0},
+                {"name": "clk2", "frequency_mhz": 200},
+            ],
+            "io_delays": [
+                {"direction": "input", "port": "data_in", "delay_ns": 2.0, "clock": "clk"},
+                {"direction": "output", "port": "data_out", "delay_ns": 3.0, "clock": "clk"},
+            ],
+            "false_paths": [
+                {"from": "rst_async", "to": "clk"},
+            ],
+        }
+        timing_path = tmp_path / "timing_model.yaml"
+        timing_path.write_text(yaml.dump(timing), encoding="utf-8")
+        output_path = tmp_path / "constraints.sdc"
+
+        result = generate_constraints(timing_path, output_path)
+        assert result.success is True
+        assert result.clock_constraints == 2
+        assert result.io_constraints == 2
+        assert result.timing_constraints == 1
+
+        # Verify file content
+        content = output_path.read_text(encoding="utf-8")
+        assert "create_clock" in content
+        assert "set_input_delay" in content
+        assert "set_output_delay" in content
+        assert "set_false_path" in content
+
+    def test_generate_from_target_kpis(self, tmp_path):
+        """Generate constraints from target KPIs when no clocks defined."""
+        import yaml
+        timing = {}
+        timing_path = tmp_path / "timing_model.yaml"
+        timing_path.write_text(yaml.dump(timing), encoding="utf-8")
+        output_path = tmp_path / "constraints.sdc"
+
+        result = generate_constraints(
+            timing_path, output_path,
+            target_kpis={"frequency_mhz": 100},
+        )
+        assert result.success is True
+        assert result.clock_constraints == 1
+
+        content = output_path.read_text(encoding="utf-8")
+        assert "period 10.000" in content
+
+    def test_generate_missing_timing_model(self, tmp_path):
+        """Should fail gracefully when timing model doesn't exist."""
+        result = generate_constraints(
+            tmp_path / "nonexistent.yaml",
+            tmp_path / "out.sdc",
+        )
+        assert result.success is False
+
+    def test_read_constraint_file(self, tmp_path):
+        """Should read and filter constraint lines."""
+        sdc = tmp_path / "test.sdc"
+        sdc.write_text(
+            "# Comment line\n"
+            "create_clock -name clk -period 10 [get_ports clk]\n"
+            "\n"
+            "set_input_delay 2.0 -clock clk [get_ports data]\n"
+            "# Another comment\n",
+            encoding="utf-8",
+        )
+        lines = read_constraint_file(sdc)
+        assert len(lines) == 2
+        assert "create_clock" in lines[0]
+        assert "set_input_delay" in lines[1]
+
+    def test_read_nonexistent_constraint_file(self):
+        lines = read_constraint_file("/nonexistent/path.sdc")
+        assert lines == []
+
+    def test_generate_with_multicycle(self, tmp_path):
+        """Generate multicycle path constraints."""
+        import yaml
+        timing = {
+            "clocks": [{"name": "clk", "period_ns": 5.0}],
+            "multicycle_paths": [
+                {"cycles": 3, "from": "data_in", "to": "data_out"},
+            ],
+        }
+        timing_path = tmp_path / "timing_model.yaml"
+        timing_path.write_text(yaml.dump(timing), encoding="utf-8")
+        output_path = tmp_path / "constraints.sdc"
+
+        result = generate_constraints(timing_path, output_path)
+        assert result.success is True
+        assert result.timing_constraints == 1
+
+        content = output_path.read_text(encoding="utf-8")
+        assert "set_multicycle_path 3" in content
