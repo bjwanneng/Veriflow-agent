@@ -9,8 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+import logging
+import re
 
 from veriflow_agent.agents.base import AgentResult, BaseAgent
+
+
+logger = logging.getLogger("veriflow.agent")
 
 
 class DebuggerAgent(BaseAgent):
@@ -27,7 +32,7 @@ class DebuggerAgent(BaseAgent):
             required_inputs=[],
             output_artifacts=["workspace/rtl/*.v"],
             max_retries=3,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -100,7 +105,14 @@ class DebuggerAgent(BaseAgent):
 
         try:
             prompt = self.render_prompt(llm_context)
-            llm_output = self.call_llm(context, prompt_override=prompt)
+
+            # Check if EventCollector is available for streaming
+            event_collector = context.get("_event_collector")
+            if event_collector:
+                llm_output = self._consume_streaming(context, prompt, event_collector)
+            else:
+                # Fall back to blocking call
+                llm_output = self.call_llm(context, prompt_override=prompt)
         except Exception as e:
             self._restore_snapshot(tb_dir, tb_snapshot)
             return AgentResult(
@@ -112,8 +124,20 @@ class DebuggerAgent(BaseAgent):
         # Restore testbench if it was modified
         self._restore_snapshot(tb_dir, tb_snapshot)
 
+        # Parse LLM output and write fixed RTL files
+        files_written = self._write_fixed_rtl(rtl_dir, llm_output)
+
         # Refresh file list after debug
         updated_paths = [str(f) for f in rtl_dir.glob("*.v") if not f.name.startswith("tb_")]
+
+        if files_written == 0:
+            return AgentResult(
+                success=False,
+                stage=self.name,
+                errors=["LLM output contained no valid Verilog modules to write"],
+                metrics={"error_type": error_type, "files_fixed": 0},
+                raw_output=llm_output[:2000],
+            )
 
         return AgentResult(
             success=True,
@@ -137,8 +161,8 @@ class DebuggerAgent(BaseAgent):
             if f.is_file():
                 try:
                     snapshot[f.name] = f.read_text(encoding="utf-8")
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Failed to snapshot %s: %s", f.name, e)
         return snapshot
 
     @staticmethod
@@ -162,3 +186,49 @@ class DebuggerAgent(BaseAgent):
                     file_path.write_text(content, encoding="utf-8")
             except Exception:
                 pass
+
+    def _write_fixed_rtl(self, rtl_dir: Path, llm_output: str) -> int:
+        """Parse LLM output and write fixed RTL files.
+
+        The LLM is expected to return the fixed Verilog code wrapped in
+        ```verilog ... ``` blocks, with one module per block.
+
+        Returns:
+            Number of files written.
+        """
+        import re
+
+        if not rtl_dir.exists():
+            rtl_dir.mkdir(parents=True, exist_ok=True)
+
+        # Extract Verilog modules from the LLM output
+        # Look for ```verilog ... ``` or ``` ... ``` blocks
+        verilog_pattern = r'```(?:verilog)?\s*\n(.*?)\n```'
+        matches = re.findall(verilog_pattern, llm_output, re.DOTALL)
+        written = 0
+
+        # If no code-fenced blocks found, try extracting raw module content
+        if not matches and "module " in llm_output and "endmodule" in llm_output:
+            start = llm_output.find("module ")
+            end = llm_output.rfind("endmodule") + len("endmodule")
+            matches = [llm_output[start:end].strip()]
+
+        for verilog_content in matches:
+            verilog_content = verilog_content.strip()
+            if not verilog_content:
+                continue
+
+            # Extract module name from "module NAME ("
+            module_match = re.search(r'module\s+(\w+)\s*\(', verilog_content, re.IGNORECASE)
+            if not module_match:
+                continue
+
+            module_name = module_match.group(1)
+            safe_name = re.sub(r'[^a-zA-Z0-9_]', '', module_name) or "unnamed"
+            rtl_path = rtl_dir / f"{safe_name}.v"
+
+            # Write the fixed RTL file
+            rtl_path.write_text(verilog_content, encoding="utf-8")
+            written += 1
+
+        return written

@@ -7,12 +7,15 @@ target KPIs from spec.json. This is a purely EDA stage — no LLM needed.
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
+logger = logging.getLogger("veriflow.agent")
+
 from veriflow_agent.agents.base import AgentResult, BaseAgent
+from veriflow_agent.tools.constraint_gen import generate_constraints
 from veriflow_agent.tools.synth import YosysTool
-from veriflow_agent.tools.constraint_gen import generate_constraints, read_constraint_file
 
 
 class SynthAgent(BaseAgent):
@@ -29,7 +32,7 @@ class SynthAgent(BaseAgent):
             required_inputs=["workspace/docs/spec.json"],
             output_artifacts=["workspace/docs/synth_report.json"],
             max_retries=1,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -104,20 +107,20 @@ class SynthAgent(BaseAgent):
                 output_path=str(constraint_path),
                 target_kpis=target_kpis,
             )
-            if constraint_result.success:
-                constraint_warnings = constraint_result.warnings
-            else:
-                constraint_warnings = constraint_result.warnings
+            constraint_warnings = constraint_result.warnings
+            if not constraint_result.success:
+                logger.warning("Constraint generation failed: %s", constraint_warnings)
         # If no timing model, skip constraint generation (not an error)
 
         # Step 4: Run Yosys
         tool = YosysTool()
         if not tool.validate_prerequisites():
-            # Graceful skip — yosys not installed
+            # Yosys not installed — report failure so pipeline can handle it
             return AgentResult(
-                success=True,
+                success=False,
                 stage=self.name,
-                warnings=["Yosys not found, skipping synthesis"],
+                errors=["Yosys not found in PATH"],
+                warnings=["Install Yosys for synthesis support"],
                 metrics={"skipped": True},
             )
 

@@ -21,7 +21,6 @@ from typing import Any
 
 from veriflow_agent.agents.base import AgentResult, BaseAgent
 
-
 # Default quality threshold (0.0 - 1.0). Below this, code goes to debugger.
 DEFAULT_QUALITY_THRESHOLD = 0.5
 
@@ -47,7 +46,7 @@ class SkillDAgent(BaseAgent):
             required_inputs=["workspace/rtl/*.v"],
             output_artifacts=["workspace/docs/quality_report.json"],
             max_retries=1,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
         self.quality_threshold = quality_threshold
 
@@ -88,8 +87,8 @@ class SkillDAgent(BaseAgent):
         # Phase 2: LLM pre-check (cheap call)
         llm_score, llm_issues = self._run_llm_precheck(rtl_files, context)
 
-        # Combined score: weighted average
-        combined_score = static_score * 0.4 + llm_score * 0.6
+        # Combined score: weighted average (LLM score weighted higher for better quality judgment)
+        combined_score = static_score * 0.3 + llm_score * 0.7
 
         # Build report
         report = self._generate_report(
@@ -244,10 +243,16 @@ class SkillDAgent(BaseAgent):
         )
 
         try:
-            llm_output = self.call_llm(
-                context,
-                prompt_override=prompt,
-            )
+            # Check if EventCollector is available for streaming
+            event_collector = context.get("_event_collector")
+            if event_collector:
+                llm_output = self._consume_streaming(context, prompt, event_collector)
+            else:
+                # Fall back to blocking call
+                llm_output = self.call_llm(
+                    context,
+                    prompt_override=prompt,
+                )
             return self._parse_llm_score(llm_output)
         except Exception as e:
             # If LLM fails, use static-only score
@@ -262,7 +267,7 @@ class SkillDAgent(BaseAgent):
         score_match = re.search(r'SCORE:\s*(\d+)', llm_output)
         if score_match:
             raw_score = int(score_match.group(1))
-            score = raw_score / 100.0
+            score = max(0.0, min(1.0, raw_score / 100.0))
 
         # Extract issues
         issues_match = re.search(r'ISSUES:\s*\n((?:-\s+.*\n?)+)', llm_output)

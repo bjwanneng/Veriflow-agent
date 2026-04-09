@@ -10,8 +10,8 @@ __author__ = "VeriFlow Team"
 __email__ = "team@veriflow.ai"
 
 # Import main types for convenience
-from veriflow_agent.graph.state import VeriFlowState, StageOutput
-from veriflow_agent.agents.base import BaseAgent, AgentResult
+from veriflow_agent.agents.base import AgentResult, BaseAgent
+from veriflow_agent.graph.state import StageOutput, VeriFlowState
 
 __all__ = [
     "__version__",

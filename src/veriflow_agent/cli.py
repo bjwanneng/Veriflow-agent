@@ -15,18 +15,13 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 import click
-
 from rich.console import Console
-
 from rich.panel import Panel
 from rich.table import Table
-from rich.progress import Progress, SpinnerColumn, TextColumn
 
-from veriflow_agent.graph import create_veriflow_graph, create_initial_state
-
+from veriflow_agent.graph import create_initial_state, create_veriflow_graph
 
 console = Console()
 logger = logging.getLogger("veriflow")
@@ -62,40 +57,71 @@ def run(project_dir: str, resume: bool):
             title="RTL Design Pipeline",
         ))
 
+    # Load LLM config from config.json
+    from veriflow_agent.gateway.config import VeriFlowConfig
+    _cfg = VeriFlowConfig.load()
+    _llm = _cfg.to_llm_config()
+
     # Load or create initial state
     if resume:
         state = _load_checkpoint(project_dir)
         if state is None:
             console.print("[yellow]No checkpoint found, starting fresh.")
-            state = create_initial_state(str(project_dir))
+            state = create_initial_state(
+                str(project_dir),
+                llm_api_key=_llm.api_key,
+                llm_base_url=_llm.base_url,
+                llm_model=_llm.model,
+            )
         else:
             console.print("[green]Resuming from checkpoint.")
     else:
-        state = create_initial_state(str(project_dir))
+        state = create_initial_state(
+            str(project_dir),
+            llm_api_key=_llm.api_key,
+            llm_base_url=_llm.base_url,
+            llm_model=_llm.model,
+        )
 
     # Build and run the graph
     graph = create_veriflow_graph(with_checkpointer=True)
 
     config = {"configurable": {"thread_id": f"veriflow-{project_dir.name}"}}
 
-    with console.status("[bold blue]Running pipeline...") as status:
-        result = None
-        t_pipeline_start = time.perf_counter()
-        try:
-            result = graph.invoke(state, config)
-        except KeyboardInterrupt:
-            console.print("\n[yellow]Pipeline interrupted by user.")
-            _save_checkpoint(project_dir, result or state)
-            sys.exit(1)
-        except Exception as e:
-            console.print(f"\n[red]Pipeline failed: {e}")
-            _save_checkpoint(project_dir, result or state)
-            sys.exit(1)
+    console.print("[bold blue]Running pipeline...[/bold blue]")
+    result = dict(state)
+    t_pipeline_start = time.perf_counter()
+    try:
+        for event in graph.stream(state, config):
+            for node_name, updates in event.items():
+                result.update(updates)
+                # Print real-time stage transitions from event_stream
+                new_events = updates.get("event_stream", [])
+                for evt in new_events:
+                    evt_type = evt.get("event_type", evt.get("type", ""))
+                    if evt_type == "stage_start":
+                        console.print(f"  [cyan]>> {evt.get('stage', node_name)} started[/cyan]")
+                    elif evt_type == "stage_end":
+                        ok = "PASS" if evt.get("payload", {}).get("success", True) else "FAIL"
+                        dur = evt.get("payload", {}).get("duration_s", 0)
+                        color = "green" if ok == "PASS" else "red"
+                        console.print(f"  [{color}]<< {evt.get('stage', node_name)} {ok} ({dur:.1f}s)[/{color}]")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Pipeline interrupted by user.")
+        _save_checkpoint(project_dir, result or state)
+        sys.exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Pipeline failed: {e}")
+        _save_checkpoint(project_dir, result or state)
+        sys.exit(1)
 
     # Display results
     total_time = time.perf_counter() - t_pipeline_start
     _display_results(result)
     console.print(f"\n[bold]Total pipeline time:[/bold] {total_time:.1f}s")
+
+    # Print observability summary
+    _display_observability_summary(result)
 
 
 @cli.command()
@@ -141,7 +167,7 @@ def mark_complete(stage: int, project_dir: str):
 # ── Helper functions ──────────────────────────────────────────────────
 
 
-def _stage_number_to_name(stage: int) -> Optional[str]:
+def _stage_number_to_name(stage: int) -> str | None:
     """Convert stage number to internal name."""
     mapping = {
         1: "architect", 15: "microarch", 2: "timing",
@@ -150,7 +176,7 @@ def _stage_number_to_name(stage: int) -> Optional[str]:
     return mapping.get(stage)
 
 
-def _load_checkpoint(project_dir: Path) -> Optional[dict]:
+def _load_checkpoint(project_dir: Path) -> dict | None:
     """Load pipeline state from checkpoint file."""
     checkpoint = project_dir / ".veriflow" / "checkpoint.json"
     if not checkpoint.exists():
@@ -332,47 +358,42 @@ def _display_results(result: dict) -> None:
         console.print(timing_table)
 
 
-@cli.command()
-@click.option("--port", default=8501, help="Port to run the UI on.")
-@click.option("--host", default="localhost", help="Host to bind the UI to.")
-def ui(port: int, host: str):
-    """Launch the Streamlit Web UI for VeriFlow-Agent."""
-    import subprocess
-    import sys
+def _display_observability_summary(result: dict) -> None:
+    """Display observability metrics from pipeline execution."""
+    total_tokens = result.get("total_tokens_used", 0)
+    total_cost = result.get("total_cost_usd", 0.0)
+    total_llm_calls = result.get("total_llm_calls", 0)
+    total_tool_calls = result.get("total_tool_calls", 0)
+    stage_durations = result.get("stage_durations", {})
+    event_stream = result.get("event_stream", [])
 
-    # Find the app.py file
-    from pathlib import Path
+    if not event_stream and not total_tokens:
+        return  # No observability data
 
-    ui_app = Path(__file__).parent / "ui" / "app.py"
+    obs_table = Table(title="Observability Summary")
+    obs_table.add_column("Metric", style="bold")
+    obs_table.add_column("Value", justify="right")
 
-    if not ui_app.exists():
-        console.print(f"[red]UI app not found at {ui_app}")
-        sys.exit(1)
+    obs_table.add_row("Total Tokens", f"{total_tokens:,}")
+    obs_table.add_row("Estimated Cost", f"${total_cost:.4f}")
+    obs_table.add_row("LLM Calls", str(total_llm_calls))
+    obs_table.add_row("Tool Calls", str(total_tool_calls))
+    obs_table.add_row("Events Collected", str(len(event_stream)))
 
-    console.print(f"[green]Starting VeriFlow-Agent Web UI...")
-    console.print(f"[dim]URL: http://{host}:{port}")
-    console.print("")
+    console.print(obs_table)
 
-    # Launch streamlit with the installed file path
-    import veriflow_agent.ui.app as _ui_mod
-
-    ui_app = Path(_ui_mod.__file__)
-
-    cmd = [
-        sys.executable, "-m", "streamlit", "run",
-        str(ui_app),
-        "--server.port", str(port),
-        "--server.address", host,
-        "--server.headless", "true",
-    ]
-
-    try:
-        subprocess.run(cmd, check=True)
-    except KeyboardInterrupt:
-        console.print("\n[yellow]UI stopped by user.")
-    except subprocess.CalledProcessError as e:
-        console.print(f"[red]UI failed with exit code {e.returncode}")
-        sys.exit(1)
+    # Print per-stage LLM trace summaries if available
+    for stage_name in ["architect", "microarch", "timing", "coder", "skill_d", "debugger"]:
+        output = result.get(f"{stage_name}_output")
+        if output and hasattr(output, "llm_trace") and output.llm_trace:
+            trace = output.llm_trace
+            console.print(
+                f"  [dim]{stage_name}: "
+                f"in={trace.input_tokens} out={trace.output_tokens} "
+                f"${trace.cost_usd:.4f} "
+                f"{trace.latency_ms}ms "
+                f"steps={len(trace.steps)}[/dim]"
+            )
 
 
 @cli.command()
@@ -393,12 +414,44 @@ def chat(host: str, port: int, share: bool):
 
 
 @cli.command()
-def tui():
-    """Launch the terminal UI (Textual TUI) for VeriFlow-Agent."""
-    from veriflow_agent.tui import VeriFlowApp
+@click.option("--host", default="127.0.0.1", help="Gateway bind host.")
+@click.option("--port", default=18789, help="Gateway bind port.")
+@click.option("--workspace", "-w", default=None, help="Default workspace directory for pipeline output.")
+@click.option("--telegram", is_flag=True, default=False, help="Also start Telegram bot channel.")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="DEBUG level logging (show all chunks, messages).")
+@click.option("--quiet", "-q", is_flag=True, default=False, help="WARNING level logging (errors only).")
+def gateway(host: str, port: int, workspace: str | None, telegram: bool, verbose: bool, quiet: bool):
+    """Launch the VeriFlow-Agent Gateway daemon (WebSocket + WebChat + optional Telegram)."""
+    from veriflow_agent.gateway import launch_gateway
 
-    app = VeriFlowApp()
-    app.run()
+    launch_gateway(host=host, port=port, enable_telegram=telegram, verbose=verbose, quiet=quiet, workspace=workspace)
+
+
+@cli.command()
+@click.option("--host", default="127.0.0.1", help="Gateway host to connect to.")
+@click.option("--port", default=18789, help="Gateway port to connect to.")
+@click.option("--session-id", default=None, help="Session ID to resume.")
+@click.option("--workspace", "-w", default=None, help="Workspace directory (default: current directory).")
+@click.option("--verbose", "-v", is_flag=True, default=False, help="DEBUG level logging (show all chunks, messages).")
+@click.option("--quiet", "-q", is_flag=True, default=False, help="WARNING level logging (errors only).")
+def tui(host: str, port: int, session_id: str | None, workspace: str | None, verbose: bool, quiet: bool):
+    """Launch the TUI client (connects to Gateway via WebSocket).
+
+    This is a terminal-based chat client that connects to a running Gateway.
+
+    Usage:
+        # Terminal 1: Start the Gateway
+        veriflow-agent gateway
+
+        # Terminal 2: Connect with TUI client
+        veriflow-agent tui
+    """
+    from veriflow_agent.tui_client import launch_tui
+
+    # Default workspace = CWD if not specified
+    ws = workspace or str(Path.cwd())
+
+    launch_tui(host=host, port=port, session_id=session_id, workspace=ws, verbose=verbose, quiet=quiet)
 
 
 def main():

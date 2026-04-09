@@ -13,11 +13,15 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
-from dataclasses import dataclass, field
+from collections.abc import Generator
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Generator
 
 logger = logging.getLogger("veriflow")
+
+# Security: --dangerously-skip-permissions is required for automated pipeline.
+# Set VERIFLOW_SKIP_PERMISSIONS=false to disable in production.
+_SKIP_PERMS = os.environ.get("VERIFLOW_SKIP_PERMISSIONS", "true").lower() in ("true", "1", "yes")
 
 # ── Windows PATH fix ────────────────────────────────────────────────────
 
@@ -61,7 +65,7 @@ def _find_claude_cli() -> str | None:
 class LLMConfig:
     """LLM backend configuration. Persisted in Gradio session state."""
 
-    backend: str = "claude_cli"  # "claude_cli" | "anthropic" | "openai"
+    backend: str = "openai"  # "openai"  (all routes use OpenAI-compatible format)
     api_key: str = ""
     base_url: str = ""
     model: str = ""
@@ -70,11 +74,7 @@ class LLMConfig:
         """Return the model name, falling back to defaults."""
         if self.model:
             return self.model
-        if self.backend == "anthropic":
-            return os.environ.get("VERIFLOW_MODEL", "claude-sonnet-4-6")
-        if self.backend == "openai":
-            return os.environ.get("OPENAI_MODEL", "gpt-4o")
-        return ""
+        return os.environ.get("OPENAI_MODEL", os.environ.get("VERIFLOW_MODEL", "gpt-4o"))
 
 
 # ── System prompt ───────────────────────────────────────────────────────
@@ -124,13 +124,10 @@ def call_llm(
         RuntimeError: If the LLM call fails.
     """
     if config.backend == "claude_cli":
-        return _call_claude_cli(messages, system_prompt)
-    elif config.backend == "anthropic":
-        return _call_anthropic(messages, config, system_prompt)
-    elif config.backend == "openai":
-        return _call_openai(messages, config, system_prompt)
+        raise RuntimeError("claude_cli backend is disabled. Use 'openai'.")
     else:
-        raise RuntimeError(f"Unknown LLM backend: {config.backend}")
+        # All backends (openai, anthropic alias, etc.) use OpenAI-compatible format
+        return _call_openai(messages, config, system_prompt)
 
 
 def call_llm_stream(
@@ -144,20 +141,10 @@ def call_llm_stream(
     don't support native streaming (claude_cli).
     """
     if config.backend == "claude_cli":
-        # claude_cli doesn't support streaming, fake it
-        response = _call_claude_cli(messages, system_prompt)
-        chunk_size = max(1, len(response) // 20)
-        for i in range(0, len(response), chunk_size):
-            yield response[i : i + chunk_size]
-
-    elif config.backend == "anthropic":
-        yield from _stream_anthropic(messages, config, system_prompt)
-
-    elif config.backend == "openai":
-        yield from _stream_openai(messages, config, system_prompt)
-
+        raise RuntimeError("claude_cli backend is disabled. Use 'openai'.")
     else:
-        raise RuntimeError(f"Unknown LLM backend: {config.backend}")
+        # All backends use OpenAI-compatible streaming format
+        yield from _stream_openai(messages, config, system_prompt)
 
 
 # ── Backend implementations ─────────────────────────────────────────────
@@ -198,16 +185,22 @@ def _call_claude_cli(
 
     try:
         if cmd == "cmd":
+            args = ["cmd", "/c", claude_exe, "--print"]
+            if _SKIP_PERMS:
+                args.append("--dangerously-skip-permissions")
             result = subprocess.run(
-                ["cmd", "/c", claude_exe, "--print", "--dangerously-skip-permissions"],
+                args,
                 input=prompt.encode("utf-8"),
                 capture_output=True,
                 timeout=600,
                 env=_get_enriched_env(),
             )
         else:
+            args = [claude_exe, "--print"]
+            if _SKIP_PERMS:
+                args.append("--dangerously-skip-permissions")
             result = subprocess.run(
-                [claude_exe, "--print", "--dangerously-skip-permissions"],
+                args,
                 input=prompt.encode("utf-8"),
                 capture_output=True,
                 timeout=600,
@@ -226,69 +219,23 @@ def _call_claude_cli(
         raise RuntimeError("Claude CLI timed out after 10 minutes")
 
 
-def _call_anthropic(
-    messages: list[dict[str, str]],
-    config: LLMConfig,
-    system_prompt: str,
-) -> str:
-    """Call LLM via Anthropic Python SDK."""
+def _make_openai_client(config: LLMConfig):
+    """Build an OpenAI client from config + env vars."""
     try:
-        import anthropic
+        from openai import OpenAI
     except ImportError:
-        raise RuntimeError("anthropic package not installed. Run: pip install anthropic")
+        raise RuntimeError("openai package not installed. Run: pip install openai")
 
-    api_key = config.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set. Configure it in Settings.")
-
-    client = anthropic.Anthropic(api_key=api_key, base_url=config.base_url or None)
-
-    api_messages = [
-        {"role": m["role"], "content": m["content"]}
-        for m in messages
-        if m["role"] != "system"
-    ]
-
-    response = client.messages.create(
-        model=config.get_effective_model(),
-        max_tokens=4096,
-        system=system_prompt,
-        messages=api_messages,
+    api_key = (
+        config.api_key
+        or os.environ.get("OPENAI_API_KEY", "")
     )
-    return response.content[0].text
-
-
-def _stream_anthropic(
-    messages: list[dict[str, str]],
-    config: LLMConfig,
-    system_prompt: str,
-) -> Generator[str, None, None]:
-    """Stream via Anthropic SDK."""
-    try:
-        import anthropic
-    except ImportError:
-        raise RuntimeError("anthropic package not installed.")
-
-    api_key = config.api_key or os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY not set.")
-
-    client = anthropic.Anthropic(api_key=api_key, base_url=config.base_url or None)
-
-    api_messages = [
-        {"role": m["role"], "content": m["content"]}
-        for m in messages
-        if m["role"] != "system"
-    ]
-
-    with client.messages.stream(
-        model=config.get_effective_model(),
-        max_tokens=4096,
-        system=system_prompt,
-        messages=api_messages,
-    ) as stream:
-        for text in stream.text_stream:
-            yield text
+        raise RuntimeError(
+            "API key not set. Set OPENAI_API_KEY or configure it in Settings."
+        )
+    base_url = config.base_url or os.environ.get("OPENAI_BASE_URL") or None
+    return OpenAI(api_key=api_key, base_url=base_url)
 
 
 def _call_openai(
@@ -296,32 +243,18 @@ def _call_openai(
     config: LLMConfig,
     system_prompt: str,
 ) -> str:
-    """Call LLM via OpenAI-compatible API."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise RuntimeError("openai package not installed. Run: pip install openai")
-
-    api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("API key not set. Configure it in Settings.")
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url=config.base_url or None,
-    )
+    """Call LLM via OpenAI-compatible API (non-streaming)."""
+    client = _make_openai_client(config)
 
     api_messages = [{"role": "system", "content": system_prompt}]
-    api_messages.extend(
-        {"role": m["role"], "content": m["content"]} for m in messages
-    )
+    api_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
 
     response = client.chat.completions.create(
         model=config.get_effective_model(),
         messages=api_messages,
         max_tokens=4096,
     )
-    return response.choices[0].message.content
+    return response.choices[0].message.content or ""
 
 
 def _stream_openai(
@@ -330,24 +263,10 @@ def _stream_openai(
     system_prompt: str,
 ) -> Generator[str, None, None]:
     """Stream via OpenAI-compatible API."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise RuntimeError("openai package not installed.")
-
-    api_key = config.api_key or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("API key not set.")
-
-    client = OpenAI(
-        api_key=api_key,
-        base_url=config.base_url or None,
-    )
+    client = _make_openai_client(config)
 
     api_messages = [{"role": "system", "content": system_prompt}]
-    api_messages.extend(
-        {"role": m["role"], "content": m["content"]} for m in messages
-    )
+    api_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
 
     stream = client.chat.completions.create(
         model=config.get_effective_model(),

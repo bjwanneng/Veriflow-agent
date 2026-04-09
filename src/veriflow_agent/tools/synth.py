@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -73,11 +72,9 @@ class YosysTool(BaseTool):
 
     def validate_prerequisites(self) -> bool:
         """Check that yosys is available."""
-        try:
-            _ = self.executable
+        if self._executable and Path(self._executable).exists():
             return True
-        except Exception:
-            return False
+        return False
 
     def run(
         self,
@@ -109,7 +106,7 @@ class YosysTool(BaseTool):
             )
 
         # Build yosys script
-        read_cmds = "\n".join(f"read_verilog {Path(f).name}" for f in filtered_files)
+        read_cmds = "\n".join(f"read_verilog {Path(f).resolve()}" for f in filtered_files)
         script_content = f"{read_cmds}\nsynth -top {top_module}\nstat -json\n"
 
         cwd_path = Path(cwd) if cwd else Path(".")

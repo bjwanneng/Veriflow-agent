@@ -2,6 +2,27 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## ⚖️ Critical Instructions (Mindset)
+1. **Sync & Plan**: Before any coding, read `readme_first.md` (if exists) and output a `/plan`. 
+2. **Hybrid Context**: You are managing a Python backend that generates Verilog. When writing Python, follow PEP8/Type Hints. When writing Verilog (CoderAgent/DebuggerAgent), follow the "Asynchronous Reset, Active Low" rule.
+3. **Tool Awareness**: This project relies on `iverilog` and `yosys`. Before fixing an Agent, check if the corresponding Tool wrapper in `src/veriflow_agent/tools/` needs updating.
+4. **LangGraph Safety**: When modifying `graph.py`, ensure the `VeriFlowState` remains consistent. Do not break the checkpointing logic.
+
+## 📁 Filesystem Hygiene
+- **Scratchpad**: Put experimental prompts or debug logs in `.claude/scratch/`.
+- **EDA Logs**: Never attempt to read raw bitstreams or massive wave files. Parse the summary JSONs in `workspace/docs/` instead.
+
+## ⚖️ Observability Constraints (CRITICAL)
+To kill the "Black Box" behavior, all development must follow these rules:
+
+1. **State Transparency**: Every LangGraph Node must update the `metadata` field in `VeriFlowState` with:
+   - `start_time`, `end_time`
+   - `llm_raw_response_path` (link to the log file)
+   - `eda_tool_return_code`
+2. **UI Intermediates**: The Streamlit UI must not just show the "Final Result." It must have a "Live Trace" view that reads from the `workspace/` directory in real-time.
+3. **No Silent Retries**: If `DebuggerAgent` triggers a retry, the reason for the retry must be explicitly logged and visible in the UI.
+4. **Tool Wrappers**: Every call to `iverilog` or `yosys` must redirect `stdout/stderr` to a unique log file in `workspace/logs/` for the UI to display.
+
 ## Commands
 
 ```bash

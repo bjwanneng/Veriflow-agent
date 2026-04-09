@@ -1,0 +1,26 @@
+{
+  "name": "veriflow-agent",
+  "version": "0.1.0",
+  "description": "Agent-based RTL design pipeline — install the Python CLI via npm",
+  "keywords": ["rtl", "verilog", "eda", "fpga", "agent", "pipeline", "langgraph"],
+  "author": "VeriFlow Team <team@veriflow.ai>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bjwanneng/Veriflow-agent.git"
+  },
+  "bin": {
+    "veriflow-agent": "./bin/veriflow-agent.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "README.md"
+  ]
+}

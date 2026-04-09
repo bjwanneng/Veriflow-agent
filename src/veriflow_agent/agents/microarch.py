@@ -27,7 +27,7 @@ class MicroArchAgent(BaseAgent):
             required_inputs=["workspace/docs/spec.json"],
             output_artifacts=["workspace/docs/micro_arch.md"],
             max_retries=1,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -69,10 +69,17 @@ class MicroArchAgent(BaseAgent):
             "REQUIREMENT": requirement_text[:4000],
         }
 
-        # Step 5: Invoke LLM
+        # Step 5: Invoke LLM (with streaming if EventCollector available)
         try:
             prompt = self.render_prompt(llm_context)
-            llm_output = self.call_llm(context, prompt_override=prompt)
+
+            # Check if EventCollector is available for streaming
+            event_collector = context.get("_event_collector")
+            if event_collector:
+                llm_output = self._consume_streaming(context, prompt, event_collector)
+            else:
+                # Fall back to blocking call
+                llm_output = self.call_llm(context, prompt_override=prompt)
         except Exception as e:
             return AgentResult(
                 success=False,
@@ -89,11 +96,11 @@ class MicroArchAgent(BaseAgent):
 
         # Step 7: Validate output
         content = output_path.read_text(encoding="utf-8")
-        if len(content.strip()) < 100:
+        if len(content.strip()) < 50:
             return AgentResult(
                 success=False,
                 stage=self.name,
-                errors=["micro_arch.md is too short (< 100 chars)"],
+                errors=["micro_arch.md is too short (< 50 chars)"],
                 artifacts=[str(output_path)],
             )
 

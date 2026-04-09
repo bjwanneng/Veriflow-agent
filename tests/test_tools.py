@@ -7,23 +7,24 @@ These tests verify:
 - EDA utility functions
 """
 
-import pytest
 from pathlib import Path
-from unittest.mock import patch, MagicMock
 
-from veriflow_agent.tools.base import BaseTool, ToolResult, ToolStatus
+from veriflow_agent.tools.base import ToolResult, ToolStatus
+from veriflow_agent.tools.constraint_gen import (
+    generate_constraints,
+    read_constraint_file,
+)
 from veriflow_agent.tools.eda_utils import (
-    find_eda_tool, get_eda_env,
-    get_tool_version, get_all_tool_versions,
-    check_version_compatibility, _compare_versions,
+    _compare_versions,
+    check_version_compatibility,
+    find_eda_tool,
+    get_all_tool_versions,
+    get_eda_env,
+    get_tool_version,
 )
 from veriflow_agent.tools.lint import IverilogTool, LintResult
-from veriflow_agent.tools.simulate import VvpTool, SimResult
-from veriflow_agent.tools.synth import YosysTool, SynthResult
-from veriflow_agent.tools.constraint_gen import (
-    generate_constraints, read_constraint_file,
-)
-
+from veriflow_agent.tools.simulate import SimResult, VvpTool
+from veriflow_agent.tools.synth import SynthResult, YosysTool
 
 # ── Base classes ──────────────────────────────────────────────────────
 

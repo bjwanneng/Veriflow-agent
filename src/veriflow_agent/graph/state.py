@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import logging
 import re
-from enum import Enum
-from typing import Annotated, Any, Optional, Sequence, TypedDict
+from collections.abc import Sequence
 from dataclasses import dataclass, field
+from enum import Enum
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import add_messages
 
@@ -210,6 +211,8 @@ class StageOutput:
     warnings: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     duration_s: float = 0.0
+    raw_output: str = ""
+    llm_trace: Any = None
 
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for serialization."""
@@ -221,10 +224,11 @@ class StageOutput:
             "warnings": self.warnings,
             "metadata": self.metadata,
             "duration_s": self.duration_s,
+            "raw_output": self.raw_output,
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "StageOutput":
+    def from_dict(cls, data: dict[str, Any]) -> StageOutput:
         """Create from dictionary."""
         return cls(
             success=data.get("success", False),
@@ -234,6 +238,7 @@ class StageOutput:
             warnings=data.get("warnings", []),
             metadata=data.get("metadata", {}),
             duration_s=data.get("duration_s", 0.0),
+            raw_output=data.get("raw_output", ""),
         )
 
 
@@ -291,6 +296,11 @@ class VeriFlowState(TypedDict):
     # Project Configuration
     project_dir: str
 
+    # LLM Configuration (propagated from session config / config.json)
+    llm_api_key: str
+    llm_base_url: str
+    llm_model: str
+
     # Execution State
     current_stage: str
     stages_completed: Annotated[list[str], lambda x, y: list(dict.fromkeys(x + y))]
@@ -309,18 +319,30 @@ class VeriFlowState(TypedDict):
     token_usage_by_stage: dict[str, int]
 
     # Stage Outputs
-    architect_output: Optional[StageOutput]
-    microarch_output: Optional[StageOutput]
-    timing_output: Optional[StageOutput]
-    coder_output: Optional[StageOutput]
-    skill_d_output: Optional[StageOutput]
-    lint_output: Optional[StageOutput]
-    sim_output: Optional[StageOutput]
-    synth_output: Optional[StageOutput]
-    debugger_output: Optional[StageOutput]
+    architect_output: StageOutput | None
+    microarch_output: StageOutput | None
+    timing_output: StageOutput | None
+    coder_output: StageOutput | None
+    skill_d_output: StageOutput | None
+    lint_output: StageOutput | None
+    sim_output: StageOutput | None
+    synth_output: StageOutput | None
+    debugger_output: StageOutput | None
 
     # Quality Gates
     quality_gates_passed: dict[str, bool]
+
+    # ── Real-time Observability (Phase 1 addition) ────────────────────────
+    event_stream: Annotated[list[dict], lambda x, y: x + y]
+    event_stream_version: int
+    active_stage: str | None
+    active_stage_start_time: float | None
+    active_llm_call_start_time: float | None
+    total_tokens_used: int
+    total_cost_usd: float
+    total_llm_calls: int
+    total_tool_calls: int
+    stage_durations: dict[str, float]
 
     # Debug/Logging
     messages: Annotated[Sequence, add_messages]
@@ -329,6 +351,9 @@ class VeriFlowState(TypedDict):
 def create_initial_state(
     project_dir: str,
     token_budget: int = DEFAULT_TOKEN_BUDGET,
+    llm_api_key: str = "",
+    llm_base_url: str = "",
+    llm_model: str = "",
 ) -> VeriFlowState:
     """Create initial state for a new pipeline run.
 
@@ -341,6 +366,9 @@ def create_initial_state(
     """
     return VeriFlowState(
         project_dir=project_dir,
+        llm_api_key=llm_api_key,
+        llm_base_url=llm_base_url,
+        llm_model=llm_model,
         current_stage="",
         stages_completed=[],
         stages_failed=[],
@@ -374,5 +402,16 @@ def create_initial_state(
         synth_output=None,
         debugger_output=None,
         quality_gates_passed={},
+        # Observability defaults
+        event_stream=[],
+        event_stream_version=0,
+        active_stage=None,
+        active_stage_start_time=None,
+        active_llm_call_start_time=None,
+        total_tokens_used=0,
+        total_cost_usd=0.0,
+        total_llm_calls=0,
+        total_tool_calls=0,
+        stage_durations={},
         messages=[],
     )

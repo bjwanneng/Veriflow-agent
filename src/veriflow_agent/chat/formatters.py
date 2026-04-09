@@ -27,11 +27,11 @@ STAGE_LABELS = {
 }
 
 STATUS_ICONS = {
-    "pending": "\u2b1c",    # white square
-    "running": "\u23f3",    # hourglass
-    "pass": "\u2705",       # check mark
-    "fail": "\u274c",       # cross mark
-    "retry": "\U0001f504",  # retry arrow
+    "pending": "[ ]",
+    "running": ">>",
+    "pass": "[OK]",
+    "fail": "[FAIL]",
+    "retry": "[>>]",
 }
 
 
@@ -41,8 +41,16 @@ def format_pipeline_start(requirement_text: str) -> str:
     return (
         f"### RTL Design Pipeline\n"
         f"> {preview}\n\n"
-        f"{_format_progress_bar([], set(), set(), {})}\n\n"
         f"Initializing pipeline...\n"
+    )
+
+
+def format_stage_started(stage_name: str, stage_num: int = 0, total_stages: int = 8) -> str:
+    """Format a stage-started notification (shown while LLM is running)."""
+    label = STAGE_LABELS.get(stage_name, stage_name)
+    icon = STATUS_ICONS["running"]
+    return (
+        f"\n**{icon} Stage {stage_num}/{total_stages}: {label}** — Running...\n"
     )
 
 
@@ -67,24 +75,19 @@ def format_stage_progress(
     errors = getattr(stage_output, "errors", [])
     artifacts = getattr(stage_output, "artifacts", [])
     metrics = getattr(stage_output, "metrics", {})
+    raw_output = getattr(stage_output, "raw_output", "")
     if isinstance(stage_output, dict):
         duration = stage_output.get("duration_s", 0)
         errors = stage_output.get("errors", [])
         artifacts = stage_output.get("artifacts", [])
         metrics = stage_output.get("metrics", {})
+        raw_output = stage_output.get("raw_output", "")
 
     icon = STATUS_ICONS["pass"] if success else STATUS_ICONS["fail"]
     status = "PASSED" if success else "FAILED"
 
-    # Build progress bar
-    progress = _format_progress_bar(
-        all_completed, set(all_failed), set(), retry_counts,
-    )
-
     lines = [
-        f"### RTL Design Pipeline\n",
-        progress,
-        f"\n---\n",
+        "\n---\n",
         f"**{icon} Stage {stage_num}/{total_stages}: {label}** — {status} ({duration:.1f}s)\n",
     ]
 
@@ -107,6 +110,15 @@ def format_stage_progress(
             lines.append(f"```\n{err[:500]}\n```")
         lines.append("</details>")
 
+    # Agent internal output (LLM response preview)
+    if raw_output:
+        preview = raw_output[:1500]
+        if len(raw_output) > 1500:
+            preview += "\n... (truncated)"
+        lines.append("\n<details><summary>Agent Output</summary>\n")
+        lines.append(f"```\n{preview}\n```")
+        lines.append("</details>")
+
     return "\n".join(lines) + "\n"
 
 
@@ -124,16 +136,7 @@ def format_debugger_event(
     source_label = STAGE_LABELS.get(feedback_source, feedback_source)
     target_label = STAGE_LABELS.get(rollback_target, rollback_target)
 
-    progress = _format_progress_bar(
-        all_completed or [],
-        set(all_failed or []),
-        set(),
-        retry_counts or {},
-    )
-
     return (
-        f"### RTL Design Pipeline\n"
-        f"{progress}\n"
         f"\n---\n"
         f"**{STATUS_ICONS['retry']} Feedback Loop Active**\n\n"
         f"| Field | Value |\n"
@@ -165,10 +168,10 @@ def format_final_summary(
     title = "Pipeline Complete!" if success else "Pipeline Failed"
 
     lines = [
-        f"\n---\n",
+        "\n---\n",
         f"## {icon} {title}\n",
-        f"\n| Metric | Value |",
-        f"|--------|-------|",
+        "\n| Metric | Value |",
+        "|--------|-------|",
         f"| Stages completed | {len(completed)}/{len(STAGE_ORDER)} |",
         f"| Stages failed | {len(failed)} |",
         f"| Token usage | {token_usage:,} / {token_budget:,} |",
@@ -179,7 +182,7 @@ def format_final_summary(
     if rtl_dir.exists():
         rtl_files = list(rtl_dir.glob("*.v"))
         if rtl_files:
-            lines.append(f"\n### Generated RTL Files\n")
+            lines.append("\n### Generated RTL Files\n")
             for f in rtl_files:
                 size = f.stat().st_size
                 lines.append(f"- `{f.name}` ({size:,} bytes)")

@@ -14,7 +14,6 @@ Supported constraint types:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -72,7 +71,7 @@ def generate_constraints(
         )
 
     try:
-        with open(timing_path, "r", encoding="utf-8") as f:
+        with open(timing_path, encoding="utf-8") as f:
             timing_model = yaml.safe_load(f)
     except (yaml.YAMLError, OSError) as e:
         return ConstraintResult(

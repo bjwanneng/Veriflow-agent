@@ -3,26 +3,23 @@
 Tests the chat handler, project manager, and formatters.
 """
 
-import pytest
-from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import MagicMock, patch
 
-from veriflow_agent.chat.project_manager import (
-    create_project_from_requirement,
-    update_requirement,
-    _generate_slug,
-)
-from veriflow_agent.chat.handler import PipelineChatHandler
 from veriflow_agent.chat.formatters import (
-    format_pipeline_start,
-    format_stage_progress,
     format_debugger_event,
     format_final_summary,
-    format_rtl_code_display,
     format_inspection_response,
+    format_pipeline_start,
+    format_rtl_code_display,
+    format_stage_progress,
+)
+from veriflow_agent.chat.handler import PipelineChatHandler
+from veriflow_agent.chat.project_manager import (
+    _generate_slug,
+    create_project_from_requirement,
+    update_requirement,
 )
 from veriflow_agent.graph.state import StageOutput
-
 
 # ── Project Manager ───────────────────────────────────────────────────
 
@@ -162,7 +159,7 @@ class TestChatHandler:
     def test_classify_intent_new(self):
         handler = PipelineChatHandler()
         intent = handler._classify_intent("Design a 4-bit ALU", [])
-        assert intent == "new"
+        assert intent == "design"
 
     def test_classify_intent_inspect(self):
         handler = PipelineChatHandler()

@@ -27,7 +27,7 @@ class SimAgent(BaseAgent):
             required_inputs=["workspace/rtl/*.v"],
             output_artifacts=[],
             max_retries=1,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:

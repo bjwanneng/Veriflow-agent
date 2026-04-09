@@ -7,6 +7,8 @@ from the architecture specification. Supports parallel per-module generation.
 from __future__ import annotations
 
 import json
+import os
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
@@ -28,7 +30,7 @@ class CoderAgent(BaseAgent):
             required_inputs=["workspace/docs/spec.json"],
             output_artifacts=["workspace/rtl/*.v"],
             max_retries=1,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -92,9 +94,12 @@ class CoderAgent(BaseAgent):
         rtl_dir.mkdir(parents=True, exist_ok=True)
 
         # Step 6: Phase 1 - Generate leaf modules in parallel
+        # Concurrency is capped to avoid rate-limit errors with API backends.
+        # Override with VERIFLOW_CODER_MAX_WORKERS (set to 1 for sequential).
         generated_files: list[str] = []
         errors: list[str] = []
-        max_workers = min(len(leaf_modules), 4) if leaf_modules else 1
+        _cap = int(os.environ.get("VERIFLOW_CODER_MAX_WORKERS", 4))
+        max_workers = min(len(leaf_modules), _cap) if leaf_modules else 1
 
         if leaf_modules:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -145,12 +150,23 @@ class CoderAgent(BaseAgent):
                 errors.extend(result.errors)
 
         # Step 8: Final validation
+        # Partial success: some modules generated but others failed.
+        # Treat as failure so the pipeline doesn't silently proceed with
+        # an incomplete RTL set, but surface skipped modules as warnings.
         success = len(generated_files) > 0 and len(errors) == 0
+        partial = len(generated_files) > 0 and len(errors) > 0
         return AgentResult(
             success=success,
             stage=self.name,
             artifacts=generated_files,
             errors=errors if not success else [],
+            warnings=(
+                [f"Partial generation: {len(errors)} module(s) failed — "
+                 f"{len(generated_files)}/{len(modules)} generated. "
+                 f"Failures: {'; '.join(errors)}"]
+                if partial else []
+            ),
+            metadata={"partial_generation": partial},
             metrics={
                 "modules_generated": len(generated_files),
                 "modules_total": len(modules),
@@ -158,6 +174,45 @@ class CoderAgent(BaseAgent):
                 "top_count": len(top_modules),
             },
         )
+
+    @staticmethod
+    def _build_peer_summary(modules: list[dict]) -> str:
+        """Build a text summary of all module ports for cross-reference."""
+        lines: list[str] = []
+        for mod in modules:
+            name = mod.get("module_name", "unknown")
+            ports = mod.get("ports", [])
+            port_strs = []
+            for p in ports:
+                direction = p.get("direction", "?")
+                width = max(1, int(p.get("width", 1)))
+                pname = p.get("name", "?")
+                port_strs.append(f"{direction} [{width-1}:0] {pname}" if width > 1 else f"{direction} {pname}")
+            lines.append(f"module {name}({', '.join(port_strs)});")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_verilog(text: str) -> str:
+        """Extract Verilog code from LLM output.
+
+        Looks for ```verilog ... ``` or ``` ... ``` blocks.
+        Falls back to returning the whole text if no fences found.
+        """
+        import re
+
+        # Try ```verilog ... ``` first
+        match = re.search(r"```(?:verilog|v)?\s*\n(.*?)```", text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+
+        # If the text itself looks like Verilog, return as-is
+        if "module " in text and "endmodule" in text:
+            # Extract from first module to last endmodule
+            start = text.find("module ")
+            end = text.rfind("endmodule") + len("endmodule")
+            return text[start:end].strip()
+
+        return text.strip()
 
     def _generate_module(
         self,
@@ -168,19 +223,7 @@ class CoderAgent(BaseAgent):
         peer_summary: str,
         context: dict[str, Any],
     ) -> AgentResult:
-        """Generate RTL for a single module via LLM.
-
-        Args:
-            project_dir: Project root path.
-            module: Module spec dict.
-            spec: Full specification.
-            microarch_text: Micro-architecture document text.
-            peer_summary: Concise port summary of all modules.
-            context: Execution context.
-
-        Returns:
-            AgentResult for this single module.
-        """
+        """Generate RTL for a single module via LLM."""
         module_name = module.get("module_name", "unknown")
         module_spec = json.dumps(module, indent=2)
 
@@ -197,9 +240,18 @@ class CoderAgent(BaseAgent):
             "SUPERVISOR_HINT": context.get("supervisor_hint", ""),
         }
 
+        # Check if EventCollector is available for streaming
+        event_collector = context.get("_event_collector")
+
         try:
             prompt = self.render_prompt(llm_context)
-            llm_output = self.call_llm(context, prompt_override=prompt)
+
+            if event_collector:
+                llm_output = self._consume_streaming(context, prompt, event_collector)
+            else:
+                # Fall back to blocking call
+                llm_output = self.call_llm(context, prompt_override=prompt)
+
         except Exception as e:
             return AgentResult(
                 success=False,
@@ -208,7 +260,8 @@ class CoderAgent(BaseAgent):
             )
 
         # Extract Verilog from LLM output and write to file
-        output_path = project_dir / "workspace" / "rtl" / f"{module_name}.v"
+        safe_name = re.sub(r'[^a-zA-Z0-9_]', '', module_name) or "unnamed"
+        output_path = project_dir / "workspace" / "rtl" / f"{safe_name}.v"
         verilog_code = self._extract_verilog(llm_output)
 
         if verilog_code:
@@ -239,60 +292,3 @@ class CoderAgent(BaseAgent):
             errors=[f"Module {module_name}: output file not created"],
             raw_output=llm_output[:1000],
         )
-
-    @staticmethod
-    def _extract_verilog(llm_output: str) -> str | None:
-        """Extract Verilog code from LLM output.
-
-        Looks for Verilog code in markdown code fences or raw module declarations.
-        """
-        import re
-
-        # Try markdown code fence with verilog/systemverilog label
-        v_match = re.search(
-            r"```(?:verilog|systemverilog|v)\s*\n([\s\S]*?)\n```",
-            llm_output,
-        )
-        if v_match:
-            return v_match.group(1).strip()
-
-        # Try any code fence that contains 'module'
-        v_match = re.search(
-            r"```\s*\n([\s\S]*?module\s+[\s\S]*?)\n```",
-            llm_output,
-        )
-        if v_match:
-            return v_match.group(1).strip()
-
-        # Try finding raw module ... endmodule
-        v_match = re.search(
-            r"(module\s+[\s\S]*?endmodule)",
-            llm_output,
-        )
-        if v_match:
-            return v_match.group(1).strip()
-
-        return None
-
-    @staticmethod
-    def _build_peer_summary(modules: list[dict]) -> str:
-        """Build a concise port-list summary of all modules.
-
-        Args:
-            modules: List of module spec dicts.
-
-        Returns:
-            Formatted string with module names and their ports.
-        """
-        lines: list[str] = []
-        for mod in modules:
-            name = mod.get("module_name", "?")
-            ports = mod.get("ports", [])
-            port_strs = [
-                f"  {p.get('direction', '?')} {p.get('width', 1)} {p.get('name', '?')}"
-                for p in ports
-            ]
-            lines.append(f"module {name} (")
-            lines.extend(port_strs)
-            lines.append(")")
-        return "\n".join(lines)

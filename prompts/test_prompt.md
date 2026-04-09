@@ -1,0 +1,1 @@
+Test prompt with {{TEST_VAR}}

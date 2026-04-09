@@ -161,6 +161,7 @@ python -c "from src.veriflow_agent import __version__; print(f'OK: VeriFlow-Agen
 | `MIGRATION_PLAN.md` | 详细迁移计划 | 规划参考 |
 | `IMPLEMENTATION_GUIDE.md` | 代码示例、 开发参考 |
 | `pyproject.toml` | 项目配置、 依赖管理 | 环境搭建 |
+| `tests/test_plan.md` | 测试计划 | **测试必读** |
 | `src/veriflow_agent/graph/graph.py` | LangGraph 图组装 | 核心参考 |
 | `src/veriflow_agent/cli.py` | CLI 入口 | 使用参考 |
 
@@ -211,9 +212,27 @@ python -c "from src.veriflow_agent import __version__; print(f'OK: VeriFlow-Agen
 
 ---
 
-## 🚀 三种使用方式
+## 🚀 四种使用方式
 
-### 1. Claude Code Agent（推荐日常开发）
+### 1. TUI Client（推荐终端开发）
+
+终端 WebSocket 客户端，连接到 Gateway 进行交互式聊天：
+
+```bash
+# Terminal 1: Start Gateway
+veriflow-agent gateway
+
+# Terminal 2: Connect TUI client
+veriflow-agent tui
+```
+
+TUI 特点：
+- 基于 Rich 的终端界面，支持 Markdown 渲染
+- 流式输出，实时显示 Pipeline 进度
+- 支持 `/quit`、`/new`、`/status` 命令
+- 自动重连和会话管理
+
+### 2. Claude Code Agent（推荐日常开发）
 
 配置后直接在 Claude Code 中使用 `/veriflow-agent run` 命令：
 
@@ -231,7 +250,7 @@ cp .claude/agents/veriflow-agent.md ~/.config/Claude/agents/
 /veriflow-agent run --project-dir ./my_alu
 ```
 
-### 2. Web UI（推荐演示和可视化）
+### 3. Web UI（推荐演示和可视化）
 
 ```bash
 # 启动 Web UI
@@ -268,9 +287,79 @@ veriflow-agent lint-stage --stage 3 --project-dir ./my_alu
 
 ---
 
-**最后更新**: 2026-04-07
+**最后更新**: 2026-04-08
 
-**项目状态**: ✅ Phase 1+2+3 全部完成 + **154测试通过** + Chat UI + 工业级部署就绪
+**项目状态**: ✅ Phase 1+2+3 全部完成 + **154测试通过** + Chat UI + TUI Client + Code Review 修复完成
+
+---
+
+## Session Handoff
+
+### 2026-04-08: 全量 Code Review + 修复
+
+**Review 范围**: 49 文件, +1617/-2672 行
+
+**发现**: 3 Critical + 8 High + 13 Medium + 10 Low
+
+#### Critical 修复 (安全 + 正确性)
+
+| # | 问题 | 修复 | 文件 |
+|---|------|------|------|
+| C1 | `--dangerously-skip-permissions` 硬编码 | 环境变量 `VERIFLOW_SKIP_PERMISSIONS` 控制 | `agents/base.py`, `chat/llm.py` |
+| C2 | LLM 输出文件名路径遍历 | `BaseAgent.sanitize_module_name()` 静态方法 | `agents/debugger.py`, `agents/coder.py`, `agents/timing.py` |
+| C3 | 路由函数直接修改 state | `feedback_source` 改为 node wrapper 返回 dict | `graph/graph.py` |
+| C4 | `handler.py` retry_counts 类型 `[]` → `{}` | 一字修复 | `chat/handler.py` |
+
+#### High 修复 (功能正确性)
+
+| # | 问题 | 修复 | 文件 |
+|---|------|------|------|
+| H1 | 6处流式消费重复代码 | `BaseAgent._consume_streaming()` 统一方法 | `agents/base.py` + 6个agent文件 |
+| H2 | IverilogTool/SynthTool validate_prerequisites 总返回True | 检查路径是否存在 | `tools/lint.py`, `tools/synth.py` |
+| H3 | YosysTool 用文件名而非完整路径 | `Path(f).resolve()` | `tools/synth.py` |
+| H4 | 侧边栏解析运算符优先级 | 添加括号 | `chat/app.py` |
+| H5 | SynthAgent Yosys未安装返回True | 改为返回False | `agents/synth.py` |
+| H6 | SynthAgent重复if/else分支 | 移除无意义分支 | `agents/synth.py` |
+
+#### Medium 修复 (质量 + 健壮性)
+
+| # | 问题 | 修复 | 文件 |
+|---|------|------|------|
+| M1 | sim parse误匹配"bypass" | 改用`\b`单词边界 | `tools/simulate.py` |
+| M2 | handler私有属性访问 | 添加`get_project_dir()`公共方法 | `chat/handler.py`, `chat/app.py` |
+| M3 | LLM score未clamp到[0,1] | `max(0.0, min(1.0, ...))` | `agents/skill_d.py` |
+| M4 | peer summary width=0崩溃 | `max(1, int(...))` | `agents/coder.py` |
+| M5 | Debugger无修改时返回True | `_write_fixed_rtl`返回计数 | `agents/debugger.py` |
+| M6 | ArchitectAgent prompt_file非线程安全 | 局部变量替代实例修改 | `agents/architect.py` |
+| M8 | snapshot静默错误 | `logger.warning()` | `agents/debugger.py` |
+
+### 2026-04-07: Agent 修复
+
+**修复的问题:**
+1. **MicroArchAgent** (`microarch.py:92`): 内容长度检查阈值从 100 字符降低到 50 字符
+2. **SkillDAgent** (`skill_d.py:92`): 评分权重从 `static*0.4 + llm*0.6` 调整为 `static*0.3 + llm*0.7`，让LLM判断更有影响力
+3. **TimingAgent** (`timing.py`): 添加 `_write_timing_artifacts()` 方法，解析LLM输出并写入 timing_model.yaml 和 testbench 文件
+4. **DebuggerAgent** (`debugger.py:115`): 添加 `_write_fixed_rtl()` 方法，解析LLM输出中的 Verilog 代码并写入 RTL 文件
+
+### 2026-04-07: TUI Client Implementation
+
+**Completed:**
+- Created `src/veriflow_agent/tui_client.py` - WebSocket TUI client
+- Updated `cli.py` `tui` command to launch TUI client instead of Gateway
+- TUI connects to Gateway at `ws://host:port/ws` using protocol frames
+- Supports commands: `/quit`, `/new`, `/status`
+- Rich terminal UI with Markdown rendering and streaming output
+
+**Architecture:**
+```
+Terminal 1: veriflow-agent gateway  # Starts Gateway daemon
+Terminal 2: veriflow-agent tui     # TUI client connects via WebSocket
+```
+
+**Files Modified:**
+- `src/veriflow_agent/tui_client.py` (new)
+- `src/veriflow_agent/cli.py` (updated tui command)
+- `readme_first.md` (updated documentation)
 
 ---
 

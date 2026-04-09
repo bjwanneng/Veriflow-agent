@@ -10,22 +10,20 @@ These tests verify:
 """
 
 import json
-import pytest
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
-from veriflow_agent.agents.base import BaseAgent, AgentResult, LLMInvocationError
+import pytest
+
 from veriflow_agent.agents.architect import ArchitectAgent
-from veriflow_agent.agents.microarch import MicroArchAgent
-from veriflow_agent.agents.timing import TimingAgent
+from veriflow_agent.agents.base import AgentResult, LLMInvocationError
 from veriflow_agent.agents.coder import CoderAgent
-from veriflow_agent.agents.skill_d import SkillDAgent
 from veriflow_agent.agents.debugger import DebuggerAgent
 from veriflow_agent.agents.lint_agent import LintAgent
+from veriflow_agent.agents.microarch import MicroArchAgent
 from veriflow_agent.agents.sim_agent import SimAgent
+from veriflow_agent.agents.skill_d import SkillDAgent
 from veriflow_agent.agents.synth import SynthAgent
-
+from veriflow_agent.agents.timing import TimingAgent
 
 # ── Fixtures ──────────────────────────────────────────────────────────
 

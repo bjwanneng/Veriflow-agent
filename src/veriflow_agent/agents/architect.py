@@ -1,18 +1,20 @@
-"""ArchitectAgent - Stage 1: Interactive Architecture Analysis.
+"""ArchitectAgent - Stage 1: Architecture Analysis.
 
-Conducts interactive Q&A with the user to produce spec.json.
-In the agent architecture, this runs as a headless LLM call that reads
-requirement.md and produces the complete architecture specification.
+Reads requirement.md and produces spec.json via LLM.
+In pipeline mode, this is a single-shot call that directly generates the spec.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from pathlib import Path
 from typing import Any
 
 from veriflow_agent.agents.base import AgentResult, BaseAgent
+
+logger = logging.getLogger("veriflow.agent")
 
 
 class ArchitectAgent(BaseAgent):
@@ -33,7 +35,7 @@ class ArchitectAgent(BaseAgent):
             required_inputs=["requirement.md"],
             output_artifacts=["workspace/docs/spec.json"],
             max_retries=1,
-            llm_backend="claude_cli",
+            llm_backend="openai",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -85,13 +87,25 @@ class ArchitectAgent(BaseAgent):
             "FREQUENCY_MHZ": str(context.get("frequency_mhz", "100")),
         }
 
-        # Step 4: Invoke LLM (use local prompt_file to avoid mutating self)
+        # Step 4: Invoke LLM (resolve prompt_file directly to avoid mutating self)
         try:
-            original_prompt_file = self.prompt_file
+            # Resolve prompt path without mutating instance state
+            saved = self.prompt_file
             self.prompt_file = prompt_file
-            prompt = self.render_prompt(llm_context)
-            self.prompt_file = original_prompt_file  # Restore
-            llm_output = self.call_llm(context, prompt_override=prompt)
+            prompt_path = self._resolve_prompt_path()
+            self.prompt_file = saved
+            prompt_content = prompt_path.read_text(encoding="utf-8")
+            for key, value in llm_context.items():
+                placeholder = "{{" + key + "}}"
+                prompt_content = prompt_content.replace(placeholder, str(value))
+
+            # Use streaming if EventCollector is available for observability
+            event_collector = context.get("_event_collector")
+            if event_collector:
+                llm_output = self._consume_streaming(context, prompt_content, event_collector)
+            else:
+                # Fall back to blocking call
+                llm_output = self.call_llm(context, prompt_override=prompt_content)
         except Exception as e:
             return AgentResult(
                 success=False,
@@ -105,6 +119,10 @@ class ArchitectAgent(BaseAgent):
 
         spec_data = self._extract_spec_json(llm_output)
         if spec_data is None:
+            # Log raw output for debugging
+            logger.warning("[%s] JSON extraction failed. LLM output preview: %s",
+                           self.name, llm_output[:500].replace('\n', '\\n'))
+
             # Fallback: check if LLM wrote the file directly
             if spec_path.exists():
                 try:

@@ -11,33 +11,27 @@ These tests verify:
 - Token budget tracking
 """
 
-import pytest
-from unittest.mock import patch, MagicMock
 
-from veriflow_agent.graph.state import (
-    VeriFlowState,
-    StageOutput,
-    create_initial_state,
-    MAX_RETRIES,
-    ErrorCategory,
-    DEFAULT_TOKEN_BUDGET,
-    categorize_error,
-    get_rollback_target,
-    check_token_budget,
-)
 from veriflow_agent.graph.graph import (
-    create_veriflow_graph,
     _run_stage,
+    create_veriflow_graph,
     node_architect,
     node_coder,
-    node_synth,
+    node_debugger,
     node_lint,
     node_sim,
-    node_debugger,
+    node_synth,
 )
-from veriflow_agent.agents.architect import ArchitectAgent
-from langgraph.graph import END
-
+from veriflow_agent.graph.state import (
+    DEFAULT_TOKEN_BUDGET,
+    MAX_RETRIES,
+    ErrorCategory,
+    StageOutput,
+    categorize_error,
+    check_token_budget,
+    create_initial_state,
+    get_rollback_target,
+)
 
 # ── State creation ────────────────────────────────────────────────────
 

@@ -1,0 +1,793 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VeriFlow-Agent</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/marked-highlight/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<style>
+  :root {
+    --bg-deep: #1a1b2e; --bg-surface: #16161e; --bg-elevated: #1f2335;
+    --border: #292e42; --text: #a9b1d6; --text-dim: #565f89;
+    --accent: #7aa2f7; --accent-hover: #89b4fa;
+    --green: #9ece6a; --red: #f7768e; --amber: #e0af68;
+    --ui-font: "Segoe UI", system-ui, sans-serif;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: var(--ui-font); background: var(--bg-deep); color: var(--text); height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  
+  /* Layout */
+  .main-wrapper { display: flex; flex: 1; overflow: hidden; }
+  .chat-container { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .logs-drawer { width: 350px; background: var(--bg-surface); border-left: 1px solid var(--border); display: none; flex-direction: column; }
+  .logs-drawer.open { display: flex; }
+  
+  /* Header */
+  .header { background: var(--bg-surface); border-bottom: 1px solid var(--border); padding: 10px 20px; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+  .header-left { display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 15px; font-weight: 700; color: var(--accent); letter-spacing: 0.5px; }
+  .header .subtitle { font-size: 12px; color: var(--text-dim); margin-left: 4px; }
+  .status-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--text-dim); transition: background 0.3s; }
+  .status-dot.connected { background: var(--green); } .status-dot.error { background: var(--red); }
+  .header-actions { display: flex; gap: 8px; }
+  .header-btn { background: var(--bg-elevated); color: var(--text); border: 1px solid var(--border); padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all 0.2s; display: flex; align-items: center; gap: 6px; }
+  .header-btn:hover { border-color: var(--accent); color: var(--accent); }
+  
+  /* Chat Area */
+  .chat-area { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; scroll-behavior: smooth; }
+  .chat-area::-webkit-scrollbar { width: 6px; } .chat-area::-webkit-scrollbar-track { background: var(--bg-deep); } .chat-area::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .msg { max-width: 85%; animation: fadeIn 0.25s ease-out; } .msg-user { align-self: flex-end; } .msg-assistant { align-self: flex-start; max-width: 95%; }
+  .msg-user .msg-bubble { background: var(--accent); color: var(--bg-deep); padding: 10px 14px; border-radius: 12px 12px 2px 12px; font-size: 14px; line-height: 1.5; }
+  .msg-assistant .msg-bubble { background: var(--bg-surface); border: 1px solid var(--border); padding: 14px 16px; border-radius: 12px 12px 12px 2px; font-size: 14px; line-height: 1.6; }
+  .msg-bubble .tag { font-size: 11px; color: var(--text-dim); margin-bottom: 4px; display: block; }
+  
+  /* Markdown */
+  .msg-bubble h1, .msg-bubble h2, .msg-bubble h3 { color: var(--accent); margin: 12px 0 6px; }
+  .msg-bubble h1 { font-size: 18px; } .msg-bubble h2 { font-size: 16px; } .msg-bubble h3 { font-size: 14px; }
+  .msg-bubble p { margin: 6px 0; }
+  .msg-bubble code { background: var(--bg-deep); padding: 1px 5px; border-radius: 3px; font-size: 13px; font-family: monospace; }
+  .msg-bubble pre { background: var(--bg-deep); border: 1px solid var(--border); border-radius: 6px; padding: 12px; overflow-x: auto; margin: 8px 0; }
+  .msg-bubble pre code { background: none; padding: 0; font-size: 13px; }
+  .msg-bubble ul, .msg-bubble ol { margin: 6px 0; padding-left: 20px; } .msg-bubble li { margin: 2px 0; }
+  .msg-bubble blockquote { border-left: 3px solid var(--accent); padding-left: 12px; color: var(--text-dim); margin: 8px 0; }
+  .msg-bubble strong { color: #c0caf5; } .msg-bubble em { color: var(--amber); }
+  .msg-bubble hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  .msg-bubble table { border-collapse: collapse; margin: 8px 0; width: 100%; }
+  .msg-bubble th, .msg-bubble td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  .msg-bubble th { background: var(--bg-elevated); color: var(--accent); }
+  
+  /* Input Area */
+  .input-container { background: var(--bg-surface); border-top: 1px solid var(--border); display: flex; flex-direction: column; flex-shrink: 0; }
+  .stage-control-bar { padding: 8px 20px; background: rgba(31,35,53,0.8); border-bottom: 1px solid var(--border); display: none; align-items: center; justify-content: space-between; font-size: 13px; }
+  .stage-control-bar.active { display: flex; }
+  .stage-control-status { display: flex; align-items: center; gap: 10px; }
+  .stage-control-actions { display: flex; gap: 8px; }
+  .stage-control-actions button { background: var(--accent); color: var(--bg-deep); border: none; padding: 5px 12px; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer; display: flex; align-items: center; gap: 4px; }
+  .stage-control-actions button:hover { background: var(--accent-hover); }
+  .stage-control-actions button.stop { background: var(--bg-elevated); color: var(--text); border: 1px solid var(--border); }
+  .stage-control-actions button.stop:hover { border-color: var(--red); color: var(--red); }
+  
+  .input-area { padding: 12px 20px; display: flex; gap: 10px; align-items: flex-end; }
+  .input-area textarea { flex: 1; background: var(--bg-deep); border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px; color: var(--text); font-size: 14px; font-family: inherit; resize: none; min-height: 44px; max-height: 160px; outline: none; transition: border-color 0.2s; line-height: 1.5; }
+  .input-area textarea:focus { border-color: var(--accent); } .input-area textarea::placeholder { color: var(--text-dim); }
+  .send-btn { background: var(--accent); color: var(--bg-deep); border: none; padding: 10px 20px; border-radius: 8px; font-size: 14px; font-weight: 600; cursor: pointer; transition: background 0.2s; white-space: nowrap; height: 44px; }
+  .send-btn:hover { background: var(--accent-hover); } .send-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  
+  /* Welcome */
+  .welcome { text-align: center; margin: auto; max-width: 520px; padding: 40px 20px; }
+  .welcome h2 { color: var(--accent); font-size: 22px; margin-bottom: 12px; }
+  .welcome p { color: var(--text-dim); font-size: 14px; line-height: 1.7; }
+  .welcome .example { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 8px; padding: 12px 16px; margin-top: 16px; text-align: left; font-style: italic; color: var(--text); font-size: 13px; }
+  
+  /* Settings Tabs Overlay */
+  .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 100; display: none; align-items: center; justify-content: center; }
+  .settings-overlay.open { display: flex; }
+  .settings-panel { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 12px; width: 600px; max-width: 90vw; max-height: 85vh; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+  .settings-header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
+  .settings-header h2 { font-size: 18px; color: var(--text); }
+  .settings-tabs { display: flex; background: var(--bg-elevated); padding: 0 16px; border-bottom: 1px solid var(--border); }
+  .tab-btn { padding: 12px 20px; color: var(--text-dim); border: none; background: transparent; cursor: pointer; border-bottom: 2px solid transparent; font-size: 13px; font-weight: 600; }
+  .tab-btn.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+  .settings-content { padding: 24px; overflow-y: auto; flex: 1; }
+  .tab-pane { display: none; } .tab-pane.active { display: block; }
+  .settings-footer { padding: 16px 24px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 12px; background: var(--bg-elevated); }
+  
+  .field { margin-bottom: 16px; }
+  .field label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .field input[type="text"], .field input[type="password"], .field input[type="number"], .field select { width: 100%; background: var(--bg-deep); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; color: var(--text); font-size: 14px; outline: none; transition: border-color 0.2s; }
+  .field input:focus, .field select:focus { border-color: var(--accent); }
+  .field .hint { font-size: 11px; color: var(--text-dim); margin-top: 4px; display: block; }
+  .field-row { display: flex; gap: 16px; } .field-row > .field { flex: 1; }
+  .radio-group { display: flex; gap: 16px; margin-top: 4px; }
+  .radio-label { display: flex; align-items: center; gap: 6px; font-size: 14px; cursor: pointer; }
+  
+  /* Tool Detectors styles */
+  .tools-list { display: flex; flex-direction: column; gap: 8px; }
+  .tool-item { background: var(--bg-deep); border: 1px solid var(--border); padding: 10px 14px; border-radius: 8px; display: flex; align-items: center; justify-content: space-between; }
+  .tool-info { display: flex; flex-direction: column; gap: 4px; }
+  .tool-name { font-weight: 600; font-size: 14px; }
+  .tool-path { font-size: 12px; color: var(--text-dim); font-family: monospace; }
+  .tool-status { display: flex; align-items: center; gap: 6px; font-size: 12px; padding: 4px 8px; border-radius: 4px; }
+  .tool-status.ok { background: rgba(158, 206, 106, 0.15); color: var(--green); }
+  .tool-status.warn { background: rgba(224, 175, 104, 0.15); color: var(--amber); }
+  .tool-status.missing { background: rgba(247, 118, 142, 0.15); color: var(--red); }
+  
+  /* Logs Drawer */
+  .logs-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--bg-elevated); }
+  .logs-header h3 { font-size: 14px; color: var(--text); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .logs-controls { display: flex; gap: 8px; align-items: center; }
+  .logs-controls select { background: var(--bg-deep); border: 1px solid var(--border); color: var(--text); font-size: 11px; padding: 2px 4px; border-radius: 4px; outline: none; }
+  .logs-content { flex: 1; overflow-y: auto; padding: 8px; font-family: monospace; font-size: 12px; background: #0f111a; display: flex; flex-direction: column; }
+  .log-line { padding: 2px 4px; border-bottom: 1px solid rgba(255,255,255,0.02); word-wrap: break-word; }
+  .log-line .ts { color: var(--text-dim); margin-right: 8px; }
+  .log-line .logger { color: var(--accent); margin-right: 8px; }
+  .log-line.l-DEBUG { color: var(--text-dim); }
+  .log-line.l-INFO { color: var(--text); }
+  .log-line.l-WARN, .log-line.l-WARNING { color: var(--amber); }
+  .log-line.l-ERROR, .log-line.l-CRITICAL { color: var(--red); }
+  
+  /* Button mixins */
+  .btn-primary { background: var(--accent); color: var(--bg-deep); border: none; padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-secondary { background: var(--bg-elevated); color: var(--text); border: 1px solid var(--border); padding: 8px 16px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  .btn-secondary:hover { border-color: var(--accent); color: var(--accent); }
+  .btn-icon { background: transparent; border: none; color: var(--text-dim); cursor: pointer; width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 4px; }
+  .btn-icon:hover { background: var(--bg-deep); color: var(--text); }
+  
+  /* Animations */
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .typing-indicator { display: inline-flex; gap: 4px; padding: 4px 0; }
+  .typing-indicator span { width: 6px; height: 6px; background: var(--text-dim); border-radius: 50%; animation: blink 1.2s infinite; }
+  .typing-indicator span:nth-child(2) { animation-delay: 0.2s; } .typing-indicator span:nth-child(3) { animation-delay: 0.4s; }
+  @keyframes blink { 0%,60%,100% { opacity: 0.3; } 30% { opacity: 1; } }
+  
+  /* Live Terminal */
+  .live-terminal { background: #0f111a; border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin: 10px 0; font-family: monospace; font-size: 12px; color: #a9b1d6; max-height: 250px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; display: none; }
+  .live-terminal.active { display: block; }
+  
+  /* Shared pipeline styles */
+  .pipeline-progress { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; padding: 8px 10px; background: var(--bg-deep); border-radius: 6px; border: 1px solid var(--border); }
+  .stage-badge { display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 600; font-family: monospace; letter-spacing: 0.3px; transition: all 0.3s ease; }
+  .stage-badge.pending { background: var(--bg-elevated); color: var(--text-dim); border: 1px solid var(--border); }
+  .stage-badge.running { background: rgba(122, 162, 247, 0.15); color: var(--accent); border: 1px solid var(--accent); animation: pulse 1.5s infinite; }
+  .stage-badge.pass { background: rgba(158, 206, 106, 0.15); color: var(--green); border: 1px solid var(--green); }
+  .stage-badge.fail { background: rgba(247, 118, 142, 0.15); color: var(--red); border: 1px solid var(--red); }
+  .stage-badge.retry { background: rgba(224, 175, 104, 0.15); color: var(--amber); border: 1px solid var(--amber); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.6; } }
+  .stage-notification { font-size: 12px; padding: 4px 0; color: var(--text-dim); font-family: monospace; animation: fadeIn 0.3s ease-out; }
+  .stage-notification .notif-pass { color: var(--green); } .stage-notification .notif-fail { color: var(--red); } .stage-notification .notif-started { color: var(--accent); } .stage-notification .notif-retry { color: var(--amber); }
+
+  /* File Explorer */
+  .fb-modal { background: var(--bg-surface); border: 1px solid var(--border); border-radius: 12px; width: 600px; max-width: 90vw; height: 500px; display: flex; flex-direction: column; overflow: hidden; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+  .fb-header { padding: 12px 16px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; background: var(--bg-elevated); }
+  .fb-path-bar { padding: 10px 16px; border-bottom: 1px solid var(--border); display: flex; gap: 8px; align-items: center; background: var(--bg-deep); }
+  .fb-path-input { flex: 1; background: var(--bg-surface); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 4px; font-family: monospace; font-size: 13px; }
+  .fb-list { flex: 1; overflow-y: auto; padding: 8px; background: var(--bg-deep); }
+  .fb-item { display: flex; align-items: center; gap: 8px; padding: 6px 12px; cursor: pointer; border-radius: 6px; font-size: 13px; color: var(--text); user-select: none; }
+  .fb-item:hover { background: var(--bg-elevated); }
+  .fb-item.selected { background: rgba(122, 162, 247, 0.15); color: var(--accent); }
+  .fb-icon { font-size: 16px; width: 20px; text-align: center; }
+  .fb-footer { padding: 12px 16px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 12px; background: var(--bg-elevated); }
+
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-left">
+    <div class="status-dot" id="statusDot"></div>
+    <h1>VeriFlow-Agent</h1>
+    <span class="subtitle">RTL Design Pipeline</span>
+    <span class="subtitle" id="workspaceLabel" style="color:var(--text-dim);font-size:11px;margin-left:8px;" title="Workspace"></span>
+  </div>
+  <div class="header-actions">
+    <button class="header-btn" onclick="toggleLogs()">📋 Logs</button>
+    <button class="header-btn" onclick="openSettings()">⚙ Settings</button>
+    <button class="header-btn" onclick="newDesign()">✨ New</button>
+  </div>
+</div>
+
+<div class="main-wrapper">
+  <div class="chat-container">
+    <div class="chat-area" id="chatArea">
+      <div class="welcome" id="welcomeBlock">
+        <h2>VeriFlow-Agent</h2>
+        <p>Describe the digital circuit you want to design.</p>
+        <div class="example">"Design a 4-bit ALU supporting ADD, SUB, AND, OR with zero and carry flags, targeting 100MHz"</div>
+      </div>
+    </div>
+    
+    <div class="input-container">
+      <div class="stage-control-bar" id="stageCtrlBar">
+        <div class="stage-control-status" id="stageCtrlStatus">
+          <span>⏸ Wait</span>
+        </div>
+        <div class="stage-control-actions">
+          <button onclick="nextStage()">▶ Next</button>
+          <button onclick="runAllStages()">▶▶ Run All</button>
+          <button class="stop" onclick="stopPipeline()">■ Stop</button>
+        </div>
+      </div>
+      
+      <div class="input-area">
+        <textarea id="msgInput" placeholder="Describe your design..." rows="1" onkeydown="handleKey(event)"></textarea>
+        <button class="send-btn" id="sendBtn" onclick="sendMessage()">Send</button>
+      </div>
+    </div>
+  </div>
+  
+  <div class="logs-drawer" id="logsDrawer">
+    <div class="logs-header">
+      <h3>📋 Server Logs</h3>
+      <div class="logs-controls">
+        <select id="logLevelConfig" onchange="setLogLevel(this.value)">
+          <option value="DEBUG">DEBUG</option>
+          <option value="INFO" selected>INFO</option>
+          <option value="WARNING">WARNING</option>
+          <option value="ERROR">ERROR</option>
+        </select>
+        <button class="btn-icon" onclick="clearLogs()" title="Clear">🗑</button>
+        <button class="btn-icon" onclick="toggleLogs()" title="Close">✕</button>
+      </div>
+    </div>
+    <div class="logs-content" id="logsContent"></div>
+  </div>
+</div>
+
+<!-- Settings Overlay -->
+<div class="settings-overlay" id="settingsOverlay">
+  <div class="settings-panel">
+    <div class="settings-header">
+      <h2>Settings</h2>
+      <button class="btn-icon" onclick="closeSettings()">✕</button>
+    </div>
+    <div class="settings-tabs">
+      <button class="tab-btn active" onclick="switchTab('tab-ai')">🤖 AI</button>
+      <button class="tab-btn" onclick="switchTab('tab-workspace')">📁 Workspace</button>
+      <button class="tab-btn" onclick="switchTab('tab-tools')">🔧 Tools</button>
+      <button class="tab-btn" onclick="switchTab('tab-pipeline')">⚙ Pipeline</button>
+    </div>
+    
+    <div class="settings-content">
+      <!-- AI Tab -->
+      <div id="tab-ai" class="tab-pane active">
+        <div class="field">
+          <label>Backend</label>
+          <select id="cfgBackend" onchange="updateBackendUI()">
+            <option value="openai" selected>OpenAI-Compatible</option>
+          </select>
+        </div>
+        <div class="field" id="wrapApiKey">
+          <label>API Key</label>
+          <input type="password" id="cfgApiKey" placeholder="sk-...">
+        </div>
+        <div class="field" id="wrapBaseUrl" style="display:none;">
+          <label>Base URL</label>
+          <input type="text" id="cfgBaseUrl" placeholder="https://api.openai.com/v1">
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Model</label>
+            <input type="text" id="cfgModel" placeholder="claude-sonnet-4-20250514">
+          </div>
+          <div class="field">
+            <label>Max Tokens</label>
+            <input type="number" id="cfgMaxTokens" placeholder="4096">
+          </div>
+        </div>
+      </div>
+      
+      <!-- Workspace Tab -->
+      <div id="tab-workspace" class="tab-pane">
+        <div class="field">
+          <label>Output Directory</label>
+          <div style="display:flex;gap:8px;">
+            <input type="text" id="cfgWorkspace" placeholder="Empty = OS temp dir" style="flex:1;">
+            <button class="btn-secondary" onclick="openFileBrowser('folder', 'workspace')">Browse...</button>
+          </div>
+          <span class="hint">Each design creates a subfolder inside this directory.</span>
+        </div>
+        <div class="field">
+          <button class="btn-secondary" onclick="saveWorkspace()">Apply Workspace</button>
+        </div>
+      </div>
+      
+      <!-- Tools Tab -->
+      <div id="tab-tools" class="tab-pane">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <span style="font-size:13px;color:var(--text-dim);">System EDA Tools Cache</span>
+          <button class="btn-secondary" style="padding:4px 8px;font-size:11px;" onclick="refreshTools()">🔄 Refresh</button>
+        </div>
+        <div id="toolsList" class="tools-list">
+          <div style="text-align:center;padding:20px;color:var(--text-dim);">Loading tools...</div>
+        </div>
+        <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--border);">
+          <div style="display:flex; justify-content:space-between; align-items:center;">
+            <span style="font-size:13px; font-weight:600;">Claude CLI Test</span>
+            <button class="btn-secondary" style="padding:4px 8px;font-size:11px;" id="btnTestClaude" onclick="testClaude()">▶ Run Test</button>
+          </div>
+          <div id="claudeTestResult" style="margin-top:8px; font-size:12px; font-family:monospace; padding:8px; background:var(--bg-deep); border-radius:4px; display:none;"></div>
+        </div>
+      </div>
+      
+      <!-- Pipeline Tab -->
+      <div id="tab-pipeline" class="tab-pane">
+        <div class="field">
+          <label>Execution Mode</label>
+          <div class="radio-group" style="margin-bottom:16px;">
+            <label class="radio-label"><input type="radio" name="cfgStageMode" value="auto"> Auto (Continuous)</label>
+            <label class="radio-label"><input type="radio" name="cfgStageMode" value="step"> Step Confirm</label>
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Token Budget</label>
+            <input type="number" id="cfgTokenBudget" placeholder="1000000">
+          </div>
+          <div class="field">
+            <label>Max Retries (Debugger)</label>
+            <input type="number" id="cfgMaxRetries" placeholder="3" min="0" max="10">
+          </div>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label>Quality Threshold</label>
+            <input type="number" id="cfgQualityThresh" placeholder="0.5" step="0.1" min="0" max="1.0">
+            <span class="hint">Skill D score required to pass (0.0-1.0)</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <div class="settings-footer">
+      <button class="btn-secondary" onclick="closeSettings()">Cancel</button>
+      <button class="btn-primary" onclick="saveSettings()">Save Configuration</button>
+    </div>
+  </div>
+</div>
+
+<!-- File Browser Overlay -->
+<div class="settings-overlay" id="fbOverlay" style="z-index: 200;">
+  <div class="fb-modal">
+    <div class="fb-header">
+      <h2 style="font-size:16px;color:var(--text);" id="fbTitle">Select Folder</h2>
+      <button class="btn-icon" onclick="closeFileBrowser()">✕</button>
+    </div>
+    <div class="fb-path-bar">
+      <button class="btn-icon" style="background:var(--bg-elevated);" onclick="fbUpDir()" title="Up one level">⬆</button>
+      <input type="text" class="fb-path-input" id="fbPathInput" onkeyup="if(event.key==='Enter') explorePath(this.value)">
+      <button class="btn-secondary" style="padding:4px 8px;" onclick="explorePath(document.getElementById('fbPathInput').value)">Go</button>
+    </div>
+    <div class="fb-list" id="fbList">
+      <div style="padding:20px;text-align:center;color:var(--text-dim);">Loading...</div>
+    </div>
+    <div class="fb-footer">
+      <button class="btn-secondary" onclick="closeFileBrowser()">Cancel</button>
+      <button class="btn-primary" id="fbSelectBtn" onclick="fbConfirmSelection()">Select</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// Logic globals
+const chatArea = document.getElementById('chatArea');
+const msgInput = document.getElementById('msgInput');
+const sendBtn = document.getElementById('sendBtn');
+const statusDot = document.getElementById('statusDot');
+const logsDrawer = document.getElementById('logsDrawer');
+const stageCtrlBar = document.getElementById('stageCtrlBar');
+const logsContent = document.getElementById('logsContent');
+
+let ws = null;
+let sessionId = null;
+let reqCounter = 0;
+let processing = false;
+let currentAssistantEl = null;
+let accumulatedMd = '';
+
+marked.setOptions({ breaks: true, gfm: true });
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  ws.onopen = () => { ws.send(JSON.stringify({ type: 'connect', id: nextId(), params: {} })); };
+  ws.onmessage = (ev) => handleFrame(JSON.parse(ev.data));
+  ws.onclose = () => { statusDot.className = 'status-dot'; setTimeout(connect, 2000); };
+  ws.onerror = () => { statusDot.className = 'status-dot error'; };
+}
+
+function nextId() { return String(++reqCounter); }
+
+function handleFrame(frame) {
+  if (frame.type === 'res') {
+    if (frame.payload?.session_id && !sessionId) {
+      sessionId = frame.payload.session_id; statusDot.className = 'status-dot connected';
+      requestWorkspaceInfo();
+      ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'get_config', params: {} }));
+    }
+    if (frame.payload?.status === 'done') { finalizeAssistant(); processing = false; sendBtn.disabled = false; stageCtrlBar.classList.remove('active'); }
+    if (frame.payload?.status === 'processing') { startAssistantStream(); }
+    if (frame.payload?.llm_backend && !frame.payload.session_id) { 
+        fillSettingsForm(frame.payload); 
+        if (frame.payload.tool_paths) currentToolPaths = frame.payload.tool_paths;
+    }
+    if (frame.payload?.workspace_dir !== undefined && frame.ok && !frame.payload.tools) { updateWorkspaceLabel(frame.payload.workspace_dir); }
+    if (frame.payload?.tools) { renderTools(frame.payload.tools); }
+    if (frame.payload?.duration_ms !== undefined) { renderClaudeTest(frame.payload); } // claude test result
+    if (frame.payload?.contents && frame.payload?.current !== undefined) { renderFbContents(frame.payload); } // explore_path result
+  } else if (frame.type === 'event') {
+    if (frame.event === 'chunk' && currentAssistantEl) { appendChunk(frame.payload.content); }
+    else if (frame.event === 'stage_update') { handleStageUpdate(frame.payload); }
+    else if (frame.event === 'error') { appendError(frame.payload.message); }
+    else if (frame.event === 'log') { appendLog(frame.payload); }
+    else if (frame.event === 'awaiting_next_stage') { handleAwaitingStage(frame.payload); }
+    else if (frame.event === 'llm_stream')  { handleLlmStream(frame.payload); }
+    else if (frame.event === 'tool_start')  { handleToolStart(frame.payload); }
+    else if (frame.event === 'tool_end')    { handleToolEnd(frame.payload); }
+    else if (frame.event === 'stage_start') { handleStageStartEarly(frame.payload); }
+  }
+}
+
+// File Explorer
+let fbMode = 'folder'; // 'folder' | 'file'
+let fbTarget = ''; // 'workspace' | 'tool'
+let fbToolId = '';
+let fbCurrentPath = '';
+let fbSelectedPath = '';
+
+function openFileBrowser(mode, target, toolId='') {
+  fbMode = mode;
+  fbTarget = target;
+  fbToolId = toolId;
+  document.getElementById('fbTitle').textContent = mode === 'folder' ? 'Select Folder' : 'Select Executable';
+  document.getElementById('fbOverlay').classList.add('open');
+  fbSelectedPath = '';
+  updateFbSelectBtn();
+  
+  let startPath = '';
+  if(target === 'workspace') startPath = document.getElementById('cfgWorkspace').value.trim();
+  explorePath(startPath || '');
+}
+function closeFileBrowser() { document.getElementById('fbOverlay').classList.remove('open'); }
+function explorePath(path) {
+  document.getElementById('fbList').innerHTML = '<div style="padding:20px;text-align:center;color:var(--text-dim);">Loading...</div>';
+  ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'explore_path', params: { path } }));
+}
+function fbUpDir() { explorePath(fbCurrentPath + '/..'); }
+function renderFbContents(payload) {
+  fbCurrentPath = payload.current;
+  document.getElementById('fbPathInput').value = fbCurrentPath;
+  const list = document.getElementById('fbList');
+  list.innerHTML = '';
+  
+  if (payload.parent !== undefined && payload.current !== '') {
+    const pItem = document.createElement('div'); pItem.className = 'fb-item';
+    pItem.innerHTML = `<span class="fb-icon">📁</span><span>.. (Parent Directory)</span>`;
+    pItem.onclick = () => explorePath(payload.parent);
+    list.appendChild(pItem);
+  }
+  
+  payload.contents.forEach(item => {
+    // Basic filter for file mode: ignore typical non-executables (optional)
+    if (fbMode === 'folder' && !item.is_dir) return; // Only show folders in folder mode
+    
+    const div = document.createElement('div'); div.className = 'fb-item';
+    div.innerHTML = `<span class="fb-icon">${item.is_dir ? '📁' : '📄'}</span><span>${item.name}</span>`;
+    
+    div.onclick = () => {
+      document.querySelectorAll('.fb-item').forEach(el => el.classList.remove('selected'));
+      div.classList.add('selected');
+      if (item.is_dir) {
+        fbSelectedPath = fbMode === 'folder' ? item.path : '';
+      } else {
+        fbSelectedPath = fbMode === 'file' ? item.path : '';
+      }
+      updateFbSelectBtn();
+    };
+    div.ondblclick = () => {
+      if (item.is_dir) explorePath(item.path);
+      else if (fbMode === 'file') { fbSelectedPath = item.path; fbConfirmSelection(); }
+    };
+    list.appendChild(div);
+  });
+  
+  // If we are in folder mode, auto-select current directory
+  if (fbMode === 'folder' && fbCurrentPath) {
+    fbSelectedPath = fbCurrentPath;
+  }
+  updateFbSelectBtn();
+}
+function updateFbSelectBtn() {
+  document.getElementById('fbSelectBtn').disabled = !fbSelectedPath;
+}
+function fbConfirmSelection() {
+  if (!fbSelectedPath) return;
+  if (fbTarget === 'workspace') {
+    document.getElementById('cfgWorkspace').value = fbSelectedPath;
+  } else if (fbTarget === 'tool' && fbToolId) {
+    // Send config update dynamically for tool_paths
+    ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'get_config', params: {} }));
+    // Wait for it? We will hook it in handleFrame but an easier way is just to patch the saving part.
+    // Let's just save the config incrementally.
+    let p = { tool_paths: currentToolPaths };
+    p.tool_paths[fbToolId] = fbSelectedPath;
+    ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'set_config', params: p }));
+    setTimeout(refreshTools, 500); // refresh after saving
+  }
+  closeFileBrowser();
+}
+
+function sendMessage() {
+  const text = msgInput.value.trim(); if (!text || processing) return;
+  const welcome = document.getElementById('welcomeBlock'); if (welcome) welcome.remove();
+  appendUserMsg(text); msgInput.value = ''; autoResize(); sendBtn.disabled = true; processing = true; stageCtrlBar.classList.remove('active');
+  ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'send', params: { message: text } }));
+}
+
+function handleKey(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); } }
+function newDesign() {
+  if (!ws) return; ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'new_design', params: {} }));
+  chatArea.innerHTML = '<div class="welcome" id="welcomeBlock"><h2>New Session</h2><p>Describe your circuit.</p></div>';
+  stageCtrlBar.classList.remove('active');
+}
+function stopPipeline() { ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'stop', params: {} })); }
+function nextStage() { stageCtrlBar.classList.remove('active'); ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'next_stage', params: {} })); }
+function runAllStages() { stageCtrlBar.classList.remove('active'); ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'run_all_stages', params: {} })); }
+
+function appendUserMsg(text) {
+  const div = document.createElement('div'); div.className = 'msg msg-user';
+  div.innerHTML = `<div class="msg-bubble">${escapeHtml(text)}</div>`; chatArea.appendChild(div); scrollBottom();
+}
+
+function startAssistantStream() {
+  accumulatedMd = ''; pipelineStages = {};
+  const div = document.createElement('div'); div.className = 'msg msg-assistant';
+  div.innerHTML = `<div class="msg-bubble"><span class="tag">VeriFlow-Agent</span><div class="content"><div class="typing-indicator"><span></span><span></span><span></span></div></div></div>`;
+  chatArea.appendChild(div); currentAssistantEl = div.querySelector('.content'); scrollBottom();
+}
+
+function appendChunk(mdText) {
+  if (!currentAssistantEl) return; accumulatedMd += mdText;
+  let contentEl = currentAssistantEl.querySelector('.md-content');
+  if (!contentEl) { contentEl = document.createElement('div'); contentEl.className = 'md-content'; currentAssistantEl.appendChild(contentEl); }
+  contentEl.innerHTML = marked.parse(accumulatedMd); scrollBottom();
+}
+
+const STAGE_ORDER = ['architect', 'microarch', 'timing', 'coder', 'skill_d', 'lint', 'sim', 'synth'];
+let pipelineStages = {};
+
+function handleStageUpdate(payload) {
+  if (!currentAssistantEl) return; const { stage, status } = payload;
+  let ti = currentAssistantEl.querySelector('.typing-indicator'); if (ti) ti.remove();
+  
+  if (stage === 'pipeline' && status === 'started') { 
+    pipelineStages = {}; 
+    renderProgressBar(); 
+    return; 
+  }
+  
+  if (STAGE_ORDER.includes(stage)) {
+    pipelineStages[stage] = status; renderProgressBar();
+    renderStageNotif(stage, status, payload.duration_s);
+  } else if (stage === 'debugger') {
+    pipelineStages[payload.source||'?'] = 'retry'; renderProgressBar();
+    renderStageNotif(stage, 'retry', payload.retry_count);
+  }
+  
+  // Live Terminal stage separator
+  const term = currentAssistantEl.querySelector('#liveTerminal');
+  if (term && status === 'started' && stage !== 'pipeline') {
+    term.textContent += `\n>> [${stage}] running...\n`;
+    term.scrollTop = term.scrollHeight;
+  }
+}
+
+function getOrCreateLiveTerm() {
+  let term = currentAssistantEl.querySelector('#liveTerminal');
+  if (!term) {
+    term = document.createElement('div');
+    term.id = 'liveTerminal';
+    term.className = 'live-terminal';
+    const progressBlock = currentAssistantEl.querySelector('.pipeline-progress');
+    if (progressBlock) {
+      progressBlock.after(term);
+    } else {
+      currentAssistantEl.insertBefore(term, currentAssistantEl.firstChild);
+    }
+  }
+  if (!term.classList.contains('active')) term.classList.add('active');
+  return term;
+}
+
+function handleLlmStream(payload) {
+  if (!currentAssistantEl) return;
+  const term = getOrCreateLiveTerm();
+  // Server sends payload.content (fixed from legacy payload.chunk)
+  term.textContent += payload.content || payload.chunk || '';
+  term.scrollTop = term.scrollHeight;
+}
+
+function handleStageStartEarly(payload) {
+  // Fires immediately when _run_stage() starts — before the LLM call blocks.
+  // Turns the stage badge to "running" 30-200s earlier than before.
+  if (!currentAssistantEl) return;
+  const stage = payload.stage || '?';
+  const label = payload.label || stage;
+  if (typeof pipelineStages !== 'undefined') {
+    pipelineStages[stage] = 'running';
+    if (typeof renderProgressBar === 'function') renderProgressBar();
+    if (typeof renderStageNotif === 'function') renderStageNotif(stage, 'started', 0);
+  }
+  const term = getOrCreateLiveTerm();
+  term.textContent += `>> [${label}] started\n`;
+  term.scrollTop = term.scrollHeight;
+}
+
+function handleToolStart(payload) {
+  if (!currentAssistantEl) return;
+  const term = getOrCreateLiveTerm();
+  const toolName = payload.tool_name || '?';
+  const stage = payload.stage ? `[${payload.stage}] ` : '';
+  term.textContent += `${stage}  ↳ tool: ${toolName}...\n`;
+  term.scrollTop = term.scrollHeight;
+}
+
+function handleToolEnd(payload) {
+  if (!currentAssistantEl) return;
+  const term = getOrCreateLiveTerm();
+  const ok = payload.success !== false;
+  const stage = payload.stage ? `[${payload.stage}] ` : '';
+  const errMsg = payload.error ? ` — ${payload.error}` : '';
+  term.textContent += ok
+    ? `${stage}  ↳ [done]\n`
+    : `${stage}  ↳ [FAILED]${errMsg}\n`;
+  term.scrollTop = term.scrollHeight;
+}
+
+function handleAwaitingStage(payload) {
+  stageCtrlBar.classList.add('active');
+  const d = document.getElementById('stageCtrlStatus');
+  d.innerHTML = `<span>⏸ Paused after <b>${payload.stage}</b>. Next: <b>${payload.next_stage}</b></span>`;
+}
+
+function renderProgressBar() {
+  let bar = currentAssistantEl.querySelector('.pipeline-progress');
+  if (!bar) { bar = document.createElement('div'); bar.className = 'pipeline-progress'; currentAssistantEl.insertBefore(bar, currentAssistantEl.firstChild); }
+  bar.innerHTML = '';
+  STAGE_ORDER.forEach(s => {
+    const st = pipelineStages[s] || 'pending';
+    const icons = { pending: '\u25CB', running: '\u25CF', pass: '\u2713', fail: '\u2717', retry: '\u21BA' };
+    const b = document.createElement('span'); b.className = `stage-badge ${st}`; b.innerHTML = `<span class="icon">${icons[st]}</span> ${s}`; bar.appendChild(b);
+  }); scrollBottom();
+}
+
+function renderStageNotif(stage, status, extra) {
+  let c = currentAssistantEl.querySelector('.stage-notifications');
+  if (!c) { c = document.createElement('div'); c.className = 'stage-notifications'; const b = currentAssistantEl.querySelector('.pipeline-progress'); if (b) b.after(c); else currentAssistantEl.insertBefore(c, currentAssistantEl.firstChild); }
+  const d = document.createElement('div'); d.className = 'stage-notification';
+  if (status === 'started') d.innerHTML = `<span class="notif-started">>> ${stage} running...</span>`;
+  else if (status === 'retry') d.innerHTML = `<span class="notif-retry">\u21BA debugger retry #${extra}</span>`;
+  else d.innerHTML = `<span class="${status==='pass'?'notif-pass':'notif-fail'}">${status==='pass'?'\u2713':'\u2717'} ${stage}</span> <span style="margin-left:8px;">${Number(extra||0).toFixed(1)}s</span>`;
+  c.appendChild(d); scrollBottom();
+}
+
+function finalizeAssistant() { if (currentAssistantEl) { let ti = currentAssistantEl.querySelector('.typing-indicator'); if (ti) ti.remove(); currentAssistantEl = null; } accumulatedMd = ''; }
+function appendError(msg) { if (currentAssistantEl) currentAssistantEl.innerHTML += `<p class="error" style="color:var(--red)">${escapeHtml(msg)}</p>`; scrollBottom(); }
+function scrollBottom() { requestAnimationFrame(() => { chatArea.scrollTop = chatArea.scrollHeight; if(logsDrawer.classList.contains('open')) logsContent.scrollTop = logsContent.scrollHeight; }); }
+function escapeHtml(str) { const d = document.createElement('div'); d.textContent = str; return d.innerHTML; }
+function autoResize() { msgInput.style.height = 'auto'; msgInput.style.height = Math.min(msgInput.scrollHeight, 160) + 'px'; }
+msgInput.addEventListener('input', autoResize);
+
+// Logs
+function toggleLogs() { logsDrawer.classList.toggle('open'); scrollBottom(); }
+function clearLogs() { logsContent.innerHTML = ''; }
+function setLogLevel(lvl) { ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'set_log_level', params: { level: lvl } })); }
+function appendLog(log) {
+  const d = document.createElement('div'); d.className = `log-line l-${log.level}`;
+  const dts = new Date(log.ts * 1000).toLocaleTimeString();
+  d.innerHTML = `<span class="ts">[${dts}]</span><span class="logger">[${log.logger.split('.').pop()}]</span> <span>${escapeHtml(log.message)}</span>`;
+  logsContent.appendChild(d);
+  if(logsContent.childElementCount > 1000) logsContent.removeChild(logsContent.firstChild);
+  if(logsDrawer.classList.contains('open')) { requestAnimationFrame(()=>logsContent.scrollTop = logsContent.scrollHeight); }
+}
+
+// Settings
+function openSettings() {
+  document.getElementById('settingsOverlay').classList.add('open');
+  if (ws) ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'get_config', params: {} }));
+  refreshTools();
+}
+function closeSettings() { document.getElementById('settingsOverlay').classList.remove('open'); }
+function switchTab(id) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+  document.querySelector(`[onclick="switchTab('${id}')"]`).classList.add('active');
+  document.getElementById(id).classList.add('active');
+}
+function updateBackendUI() {
+  const b = document.getElementById('cfgBackend').value;
+  document.getElementById('wrapApiKey').style.display = 'block';
+  document.getElementById('wrapBaseUrl').style.display = b === 'openai' ? 'block' : 'none';
+}
+function fillSettingsForm(cfg) {
+  ['Backend', 'BaseUrl', 'Model', 'MaxTokens', 'Workspace', 'TokenBudget', 'MaxRetries', 'QualityThresh'].forEach(k => {
+    let el = document.getElementById('cfg'+k);
+    let val = cfg[k.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase()];
+    if(el && val !== undefined) { if(k === 'Backend') el.value = val; else el.value = val; }
+  });
+  if (cfg.api_key) document.getElementById('cfgApiKey').placeholder = cfg.api_key;
+  if (cfg.stage_mode) document.querySelector(`input[name="cfgStageMode"][value="${cfg.stage_mode}"]`).checked = true;
+  updateBackendUI();
+}
+function saveSettings() {
+  let sm = document.querySelector('input[name="cfgStageMode"]:checked');
+  const p = {
+    llm_backend: document.getElementById('cfgBackend').value,
+    base_url: document.getElementById('cfgBaseUrl').value,
+    model: document.getElementById('cfgModel').value,
+    max_tokens: parseInt(document.getElementById('cfgMaxTokens').value)||4096,
+    stage_mode: sm ? sm.value : 'auto',
+    token_budget: parseInt(document.getElementById('cfgTokenBudget').value)||1000000,
+    max_retries: parseInt(document.getElementById('cfgMaxRetries').value)||3,
+    quality_threshold: parseFloat(document.getElementById('cfgQualityThresh').value)||0.5,
+  };
+  const ak = document.getElementById('cfgApiKey').value; if(ak) p.api_key = ak;
+  ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'set_config', params: p }));
+  closeSettings();
+}
+
+// Workspace
+function saveWorkspace() {
+  const path = document.getElementById('cfgWorkspace').value.trim();
+  if (ws) ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'set_workspace', params: { path } }));
+}
+function updateWorkspaceLabel(p) {
+  const lbl = document.getElementById('workspaceLabel');
+  if (p) { const pts = p.replace(/\\/g, '/').split('/').filter(Boolean); lbl.textContent = '\uD83D\uDCC2 ' + pts.pop(); lbl.title = p; }
+}
+function requestWorkspaceInfo() { if (ws) ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'get_workspace', params: {} })); }
+
+// Tools
+let currentToolPaths = {};
+function refreshTools() {
+  document.getElementById('toolsList').innerHTML = '<div style="padding:20px;color:var(--text-dim);text-align:center;">Detecting tools...</div>';
+  ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'detect_tools', params: {} }));
+}
+function renderTools(tools) {
+  const c = document.getElementById('toolsList'); c.innerHTML = '';
+  Object.values(tools).forEach(t => {
+    let icon = {ok:'✓', warn:'⚠', missing:'✕'}[t.status];
+    c.innerHTML += `
+      <div class="tool-item">
+        <div class="tool-info" style="flex:1;min-width:0;padding-right:12px;">
+          <div class="tool-name">${t.display}</div>
+          <div class="tool-path" style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${t.path || t.note}">${t.path || t.note}</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px;">
+            <div class="tool-status ${t.status}">${icon} ${t.status.toUpperCase()}</div>
+            <button class="btn-icon" style="border:1px solid var(--border);" title="Override Path" onclick="openFileBrowser('file', 'tool', '${t.name}')">✏️</button>
+        </div>
+      </div>
+    `;
+  });
+}
+function testClaude() {
+  const b = document.getElementById('btnTestClaude'); b.textContent = 'Running...'; b.disabled = true;
+  document.getElementById('claudeTestResult').style.display = 'block';
+  document.getElementById('claudeTestResult').textContent = 'Waiting for response...';
+  ws.send(JSON.stringify({ type: 'req', id: nextId(), method: 'test_claude_cli', params: {} }));
+}
+function renderClaudeTest(res) {
+  const b = document.getElementById('btnTestClaude'); b.textContent = '▶ Run Test'; b.disabled = false;
+  const d = document.getElementById('claudeTestResult');
+  d.style.color = res.success ? 'var(--green)' : 'var(--red)';
+  d.textContent = `[${res.duration_ms}ms] ${res.message}`;
+}
+
+connect();
+msgInput.focus();
+</script>
+</body>
+</html>

@@ -14,12 +14,11 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger("veriflow")
 
 
-def find_eda_tool(tool_name: str) -> Optional[str]:
+def find_eda_tool(tool_name: str) -> str | None:
     """Locate an EDA tool executable.
 
     Search order:
@@ -116,7 +115,7 @@ def _get_oss_cad_bin_dirs() -> list[Path]:
     return candidates
 
 
-def _find_oss_cad_suite() -> Optional[Path]:
+def _find_oss_cad_suite() -> Path | None:
     """Find the oss-cad-suite root directory (containing bin/).
 
     Returns:
@@ -154,7 +153,7 @@ _MIN_VERSIONS: dict[str, str] = {
 }
 
 
-def get_tool_version(tool_name: str) -> Optional[str]:
+def get_tool_version(tool_name: str) -> str | None:
     """Detect the version of an EDA tool.
 
     Args:
@@ -193,7 +192,7 @@ def get_tool_version(tool_name: str) -> Optional[str]:
     return None
 
 
-def _try_generic_version(tool_path: str) -> Optional[str]:
+def _try_generic_version(tool_path: str) -> str | None:
     """Fallback version detection using --version flag."""
     for flag in ["--version", "-V", "-v"]:
         try:
@@ -214,7 +213,7 @@ def _try_generic_version(tool_path: str) -> Optional[str]:
     return None
 
 
-def get_all_tool_versions() -> dict[str, Optional[str]]:
+def get_all_tool_versions() -> dict[str, str | None]:
     """Detect versions of all known EDA tools.
 
     Returns:

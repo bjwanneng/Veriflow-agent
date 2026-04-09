@@ -8,7 +8,6 @@ Two modes:
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -64,11 +63,9 @@ class IverilogTool(BaseTool):
 
     def validate_prerequisites(self) -> bool:
         """Check that iverilog is available."""
-        try:
-            _ = self.executable
+        if self._executable and Path(self._executable).exists():
             return True
-        except Exception:
-            return False
+        return False
 
     def run(
         self,

@@ -6,20 +6,43 @@ must inherit from. It provides common functionality for:
 - Input/output validation
 - Error handling and retry logic
 - Metrics collection
+- Real-time observability via streaming events
 """
 
 from __future__ import annotations
 
-import json
+import logging
 import os
+import re
 import subprocess
 from abc import ABC, abstractmethod
+from collections.abc import Generator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from langchain_core.language_models import BaseLanguageModel
+    pass
+
+# Observability imports for streaming support
+from veriflow_agent.observability import (
+    EventCollector,
+    LLMEvent,
+    create_error_event,
+    create_metrics_event,
+    create_session_init_event,
+    create_stream_end_event,
+    create_text_delta_event,
+    create_tool_complete_event,
+    create_tool_error_event,
+    create_tool_start_event,
+)
+
+logger = logging.getLogger("veriflow.agent")
+
+# Security: --dangerously-skip-permissions is opt-in for automated pipelines.
+# Set VERIFLOW_SKIP_PERMISSIONS=true to enable (required for headless CI/CD).
+_SKIP_PERMS = os.environ.get("VERIFLOW_SKIP_PERMISSIONS", "false").lower() in ("true", "1", "yes")
 
 
 @dataclass
@@ -63,7 +86,7 @@ class AgentResult:
         }
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AgentResult":
+    def from_dict(cls, data: dict[str, Any]) -> AgentResult:
         """Create from dictionary (e.g., when loading checkpoint)."""
         return cls(
             success=data.get("success", False),
@@ -139,7 +162,7 @@ class BaseAgent(ABC):
         required_inputs: list[str] | None = None,
         output_artifacts: list[str] | None = None,
         max_retries: int = 3,
-        llm_backend: str = "claude_cli",  # or "anthropic", "langchain"
+        llm_backend: str = "openai",  # "openai" | "langchain"
     ):
         """Initialize the agent.
 
@@ -204,6 +227,11 @@ class BaseAgent(ABC):
             if not full_path.exists():
                 missing.append(str(input_file))
 
+        if missing:
+            logger.warning("[%s] Input validation: missing %s", self.name, missing)
+        else:
+            logger.debug("[%s] Input validation: all inputs present", self.name)
+
         return len(missing) == 0, missing
 
     def validate_outputs(
@@ -236,6 +264,11 @@ class BaseAgent(ABC):
                     found.append(str(full_path))
                 else:
                     missing.append(pattern)
+
+        if missing:
+            logger.warning("[%s] Output validation: missing %s", self.name, missing)
+        elif self.output_artifacts:
+            logger.debug("[%s] Output validation: all %d artifacts found", self.name, len(found))
 
         return len(missing) == 0, found, missing
 
@@ -279,6 +312,7 @@ class BaseAgent(ABC):
             placeholder = "{{" + key + "}}"
             content = content.replace(placeholder, str(value))
 
+        logger.debug("[%s] Rendered prompt from %s (%d chars)", self.name, prompt_path.name, len(content))
         return content
 
     def call_llm(
@@ -287,16 +321,12 @@ class BaseAgent(ABC):
         prompt_override: str | None = None,
         system_prompt: str | None = None,
     ) -> str:
-        """Invoke the LLM with the configured backend.
-
-        Supports multiple backends:
-        - "claude_cli": Use Claude CLI subprocess (legacy, backward compatible)
-        - "anthropic": Use Anthropic Python SDK
-        - "langchain": Use LangChain abstraction
-
-        After each call, estimated token usage is stored in self._last_token_usage
-        for retrieval by the caller (typically via get_last_token_usage()).
-
+        """Invoke the LLM using stream consumption for real-time UI observability.
+        
+        This wraps call_llm_streaming to guarantee that all agents automatically
+        emit TEXT_DELTA chunks to veriflow.stream, driving the Live Terminal UI,
+        even if the agent itself didn't explicitly request streaming.
+        
         Args:
             context: Execution context with prompt variables
             prompt_override: Optional override for the prompt file content
@@ -309,14 +339,16 @@ class BaseAgent(ABC):
             LLMInvocationError: If the LLM call fails
         """
         self._last_token_usage = 0
-        if self.llm_backend == "claude_cli":
-            return self._call_llm_claude_cli(context, prompt_override, system_prompt)
-        elif self.llm_backend == "anthropic":
-            return self._call_llm_anthropic(context, prompt_override, system_prompt)
-        elif self.llm_backend == "langchain":
-            return self._call_llm_langchain(context, prompt_override, system_prompt)
-        else:
-            raise LLMInvocationError(f"Unknown LLM backend: {self.llm_backend}")
+        prompt = prompt_override or self._resolve_prompt_path().read_text(encoding="utf-8")
+        event_collector = context.get("_event_collector")
+        
+        # Transparently proxy to consume streaming to hijack text events
+        return self._consume_streaming(
+            context,
+            prompt,
+            event_collector=event_collector,
+            system_prompt=system_prompt,
+        )
 
     def get_last_token_usage(self) -> int:
         """Get the estimated token usage from the most recent LLM call.
@@ -325,6 +357,22 @@ class BaseAgent(ABC):
             Estimated token count (0 if no call made yet).
         """
         return getattr(self, "_last_token_usage", 0)
+
+    @staticmethod
+    def sanitize_module_name(name: str) -> str:
+        """Sanitize LLM-extracted module name for filesystem safety.
+
+        Removes any character that is not alphanumeric or underscore.
+        Prevents path traversal attacks from malicious LLM output.
+
+        Args:
+            name: Raw module name extracted from LLM output.
+
+        Returns:
+            Safe module name string, or "unnamed" if result is empty.
+        """
+        safe = re.sub(r'[^a-zA-Z0-9_]', '', name)
+        return safe if safe else "unnamed"
 
     def _estimate_tokens(self, text: str) -> int:
         """Rough token estimate: ~4 chars per token for English/code.
@@ -336,6 +384,78 @@ class BaseAgent(ABC):
             Estimated token count.
         """
         return max(1, len(text) // 4)
+
+    def _consume_streaming(
+        self,
+        context: dict[str, Any],
+        prompt: str,
+        event_collector: EventCollector | None = None,
+        system_prompt: str | None = None,
+    ) -> str:
+        """Consume streaming LLM call and return accumulated text.
+
+        Handles the mixed LLMEvent/AgentResult yield types from
+        call_llm_streaming, providing a clean string return for callers.
+
+        Args:
+            context: Execution context.
+            prompt: Rendered prompt string.
+            event_collector: Optional event collector for observability.
+
+        Returns:
+            Accumulated LLM output text.
+
+        Raises:
+            LLMInvocationError: If the streaming call reports failure.
+        """
+        import json as _json
+        stream_logger = logging.getLogger("veriflow.stream")
+
+        for item in self.call_llm_streaming(
+            context,
+            prompt_override=prompt,
+            system_prompt=system_prompt,
+            event_collector=event_collector,
+        ):
+            if isinstance(item, AgentResult):
+                if not item.success:
+                    raise LLMInvocationError(
+                        f"LLM streaming failed: {item.errors}"
+                    )
+                return item.raw_output
+
+            elif hasattr(item, "event_type"):
+                etype = (
+                    item.event_type.name
+                    if hasattr(item.event_type, "name")
+                    else str(item.event_type)
+                )
+
+                if etype == "TEXT_DELTA":
+                    chunk = item.payload.get("text", "")
+                    if chunk:
+                        # Prefix "TEXT:" so WSLogHandler can parse the event type
+                        stream_logger.info("TEXT:" + chunk)
+
+                elif etype == "TOOL_START":
+                    data = _json.dumps({
+                        "tool_name": item.payload.get("tool_name", "unknown"),
+                        "call_id": item.payload.get("call_id", ""),
+                        "stage": self.name,
+                    })
+                    stream_logger.info("TOOL_START:" + data)
+
+                elif etype in ("TOOL_COMPLETE", "TOOL_ERROR"):
+                    success = etype == "TOOL_COMPLETE"
+                    data = _json.dumps({
+                        "call_id": item.payload.get("call_id", ""),
+                        "success": success,
+                        "error": item.payload.get("error", "") if not success else "",
+                        "stage": self.name,
+                    })
+                    stream_logger.info("TOOL_END:" + data)
+
+        raise LLMInvocationError("LLM streaming ended without returning a result")
 
     def _call_llm_claude_cli(
         self,
@@ -362,11 +482,14 @@ class BaseAgent(ABC):
 
         # Call Claude CLI
         try:
+            cmd = [claude_exe, "--print"]
+            if _SKIP_PERMS:
+                cmd.append("--dangerously-skip-permissions")
             result = subprocess.run(
-                [claude_exe, "--print", "--dangerously-skip-permissions"],
+                cmd,
                 input=prompt_content.encode("utf-8"),
                 capture_output=True,
-                timeout=600,  # 10 minute timeout
+                timeout=1800,  # 30 minute timeout for complex designs
             )
             stdout = result.stdout.decode("utf-8", errors="replace")
             stderr = result.stderr.decode("utf-8", errors="replace")
@@ -382,60 +505,9 @@ class BaseAgent(ABC):
             return stdout
 
         except subprocess.TimeoutExpired:
-            raise LLMInvocationError("Claude CLI timed out after 10 minutes")
+            raise LLMInvocationError("Claude CLI timed out after 30 minutes")
         except Exception as e:
             raise LLMInvocationError(f"Failed to invoke Claude CLI: {e}")
-
-    def _call_llm_anthropic(
-        self,
-        context: dict[str, Any],
-        prompt_override: str | None = None,
-        system_prompt: str | None = None,
-    ) -> str:
-        """Call LLM using Anthropic Python SDK."""
-        try:
-            import anthropic
-        except ImportError:
-            raise LLMInvocationError(
-                "anthropic package not installed. Run: pip install anthropic"
-            )
-
-        # Initialize client
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise LLMInvocationError("ANTHROPIC_API_KEY environment variable not set")
-
-        client = anthropic.Anthropic(api_key=api_key)
-
-        # Read prompt
-        if prompt_override:
-            prompt_content = prompt_override
-        else:
-            prompt_content = self._resolve_prompt_path().read_text(encoding="utf-8")
-
-        # Call API
-        try:
-            message = client.messages.create(
-                model=os.environ.get("VERIFLOW_MODEL", "claude-sonnet-4-6"),
-                max_tokens=4096,
-                temperature=0.1,
-                system=system_prompt if system_prompt else None,
-                messages=[{"role": "user", "content": prompt_content}],
-            )
-            # Track token usage from API response
-            if hasattr(message, "usage") and message.usage:
-                self._last_token_usage = (
-                    getattr(message.usage, "input_tokens", 0)
-                    + getattr(message.usage, "output_tokens", 0)
-                )
-            else:
-                self._last_token_usage = (
-                    self._estimate_tokens(prompt_content)
-                    + self._estimate_tokens(message.content[0].text)
-                )
-            return message.content[0].text
-        except Exception as e:
-            raise LLMInvocationError(f"Anthropic API call failed: {e}")
 
     def _call_llm_langchain(
         self,
@@ -445,8 +517,8 @@ class BaseAgent(ABC):
     ) -> str:
         """Call LLM using LangChain abstraction."""
         try:
-            from langchain_core.prompts import ChatPromptTemplate
             from langchain_anthropic import ChatAnthropic
+            from langchain_core.prompts import ChatPromptTemplate
         except ImportError:
             raise LLMInvocationError(
                 "langchain packages not installed. Run: pip install langchain-core langchain-anthropic"
@@ -521,3 +593,581 @@ class BaseAgent(ABC):
                 return str(p)
 
         return None
+
+    # === NEW: Streaming LLM Methods for Real-time Observability ===
+
+    def call_llm_streaming(
+        self,
+        context: dict[str, Any],
+        prompt_override: str | None = None,
+        system_prompt: str | None = None,
+        event_collector: EventCollector | None = None,
+    ) -> Generator[LLMEvent | AgentResult, None, None]:
+        """Invoke the LLM with streaming and event collection.
+
+        This method provides real-time observability by yielding events
+        during LLM execution. Events include text deltas, tool calls,
+        metrics updates, and completion status.
+
+        Args:
+            context: Execution context with prompt variables
+            prompt_override: Optional override for the prompt file content
+            system_prompt: Optional system prompt to prepend
+            event_collector: Optional collector to receive all events
+
+        Yields:
+            LLMEvent: Real-time events during execution (text_delta, tool_start, etc.)
+
+        Returns:
+            AgentResult: Final result with success status, artifacts, metrics
+
+        Example:
+            ```python
+            collector = EventCollector("coder")
+            for event in agent.call_llm_streaming(context, event_collector=collector):
+                if event.event_type == EventType.TEXT_DELTA:
+                    print(event.payload["text"], end="")
+
+            result = collector.get_result()
+            trace = collector.get_trace()
+            ```
+        """
+        self._last_token_usage = 0
+        logger.info("[%s] Calling LLM via %s backend (streaming)", self.name, self.llm_backend)
+
+        if self.llm_backend == "claude_cli":
+            raise LLMInvocationError(
+                "claude_cli backend is disabled. Set llm_backend='openai' or 'langchain'."
+            )
+        elif self.llm_backend in ("openai", "anthropic"):
+            # Both route to the OpenAI-compatible implementation.
+            # Anthropic is kept as an alias so existing configs don't break.
+            yield from self._call_llm_openai_streaming(
+                context, prompt_override, system_prompt, event_collector
+            )
+        elif self.llm_backend == "langchain":
+            yield from self._call_llm_langchain_streaming(
+                context, prompt_override, system_prompt, event_collector
+            )
+        else:
+            raise LLMInvocationError(f"Unknown LLM backend: {self.llm_backend}")
+
+    def _call_llm_claude_cli_streaming(
+        self,
+        context: dict[str, Any],  # noqa: ARG002 — kept for interface symmetry; callers pass rendered prompt via prompt_override
+        prompt_override: str | None,
+        system_prompt: str | None,
+        event_collector: EventCollector | None,
+    ) -> Generator[LLMEvent | AgentResult, None, None]:
+        """Call LLM using Claude CLI with stream-json output format.
+
+        This implementation uses --output-format stream-json to receive
+        real-time events from the Claude CLI subprocess.
+        """
+        import json as json_mod
+        import subprocess
+
+        claude_exe = self._find_claude_cli()
+        if not claude_exe:
+            raise LLMInvocationError("Claude CLI not found. Please install Claude Code.")
+
+        # Build prompt
+        if prompt_override:
+            prompt_content = prompt_override
+        else:
+            prompt_path = self._resolve_prompt_path()
+            prompt_content = prompt_path.read_text(encoding="utf-8")
+
+        if system_prompt:
+            prompt_content = f"{system_prompt}\n\n{prompt_content}"
+
+        # Build command with stream-json
+        cmd = [
+            claude_exe,
+            "--print",
+            "--verbose",
+            "--output-format", "stream-json",
+        ]
+        if _SKIP_PERMS:
+            cmd.append("--dangerously-skip-permissions")
+
+        # Start subprocess
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        except Exception as e:
+            raise LLMInvocationError(f"Failed to start Claude CLI: {e}")
+
+        # Send prompt
+        try:
+            proc.stdin.write(prompt_content)
+            proc.stdin.close()
+        except Exception as e:
+            raise LLMInvocationError(f"Failed to send prompt to Claude CLI: {e}")
+
+        # Process stream
+        text_parts = []
+        api_success = False
+        session_info = {}
+
+        try:
+            for line in proc.stdout:
+                line = line.rstrip()
+                if not line:
+                    continue
+
+                try:
+                    event_data = json_mod.loads(line)
+                except json_mod.JSONDecodeError:
+                    continue
+
+                # Parse event and yield
+                event_type = event_data.get("type", "")
+
+                if event_type == "system" and event_data.get("subtype") == "init":
+                    session_info = {
+                        "session_id": event_data.get("session_id", ""),
+                        "tools": event_data.get("tools", []),
+                    }
+                    event = create_session_init_event(
+                        stage=self.name,
+                        session_id=session_info.get("session_id", ""),
+                        tools=session_info.get("tools", []),
+                    )
+                    if event_collector:
+                        event_collector.on_event(event)
+                    yield event
+
+                elif event_type == "assistant":
+                    msg = event_data.get("message", {})
+                    for block in msg.get("content", []):
+                        if not isinstance(block, dict):
+                            continue
+
+                        btype = block.get("type", "")
+
+                        if btype == "text":
+                            text = block.get("text", "")
+                            text_parts.append(text)
+                            event = create_text_delta_event(
+                                stage=self.name,
+                                text=text,
+                                cumulative_text="".join(text_parts),
+                                token_index=len(text_parts),
+                            )
+                            if event_collector:
+                                event_collector.on_event(event)
+                            yield event
+
+                        elif btype == "tool_use":
+                            event = create_tool_start_event(
+                                stage=self.name,
+                                tool_name=block.get("name", ""),
+                                tool_input=block.get("input", {}),
+                                call_id=block.get("id", ""),
+                            )
+                            if event_collector:
+                                event_collector.on_event(event)
+                            yield event
+
+                    # Check usage
+                    usage = msg.get("usage", {})
+                    if usage:
+                        event = create_metrics_event(
+                            stage=self.name,
+                            input_tokens=usage.get("input_tokens", 0),
+                            output_tokens=usage.get("output_tokens", 0),
+                        )
+                        if event_collector:
+                            event_collector.on_event(event)
+                        yield event
+
+                elif event_type == "user":
+                    # Tool result
+                    for block in event_data.get("message", {}).get("content", []):
+                        if block.get("type") == "tool_result":
+                            is_error = block.get("is_error", False)
+                            if is_error:
+                                event = create_tool_error_event(
+                                    stage=self.name,
+                                    call_id=block.get("tool_use_id", ""),
+                                    error=block.get("content", "Tool failed"),
+                                )
+                            else:
+                                event = create_tool_complete_event(
+                                    stage=self.name,
+                                    call_id=block.get("tool_use_id", ""),
+                                    tool_output={"content": block.get("content", "")},
+                                )
+                            if event_collector:
+                                event_collector.on_event(event)
+                            yield event
+
+                elif event_type == "result":
+                    api_success = event_data.get("subtype") == "success"
+                    event = create_stream_end_event(
+                        stage=self.name,
+                        success=api_success,
+                        error_message="" if api_success else "Claude CLI returned error",
+                        duration_ms=event_data.get("duration_ms", 0),
+                    )
+                    if event_collector:
+                        event_collector.on_event(event)
+                    yield event
+
+        finally:
+            # Wait for process to complete; escalate to kill() on Unix if
+            # terminate() (SIGTERM) is ignored, to prevent indefinite hang.
+            try:
+                proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+        # Build final result
+        output = "".join(text_parts)
+        success = api_success or "STAGE_COMPLETE" in output
+
+        # Estimate token usage
+        self._last_token_usage = (
+            self._estimate_tokens(prompt_content) + self._estimate_tokens(output)
+        )
+
+        # Capture stderr for error diagnostics when the CLI reports failure
+        stderr_output = ""
+        try:
+            stderr_output = proc.stderr.read() if proc.stderr else ""
+        except Exception:
+            pass
+
+        result = AgentResult(
+            success=success,
+            stage=self.name,
+            raw_output=output,
+            metrics={"token_usage": self._last_token_usage},
+            errors=(
+                [f"Claude CLI exited with failure. stderr: {stderr_output[:500]}"]
+                if not success else []
+            ),
+        )
+
+        yield result
+
+    def _call_llm_openai_streaming(
+        self,
+        context: dict[str, Any],
+        prompt_override: str | None,
+        system_prompt: str | None,
+        event_collector: EventCollector | None,
+    ) -> Generator[LLMEvent | AgentResult, None, None]:
+        """Call LLM using OpenAI-compatible API with streaming.
+
+        Works with any OpenAI-compatible endpoint (OpenAI, Anthropic via
+        openai-compat, local vLLM, LM Studio, etc.).
+
+        Config priority: context dict (from VeriFlowState) → env vars → default.
+        """
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise LLMInvocationError(
+                "openai package not installed. Run: pip install openai"
+            )
+
+        api_key = (
+            context.get("llm_api_key", "")
+            or os.environ.get("OPENAI_API_KEY", "")
+        )
+        if not api_key:
+            raise LLMInvocationError(
+                "API key not configured. Set it in the Settings panel or via OPENAI_API_KEY."
+            )
+
+        base_url = context.get("llm_base_url", "") or os.environ.get("OPENAI_BASE_URL") or None
+        model = (
+            context.get("llm_model", "")
+            or os.environ.get("VERIFLOW_MODEL", "")
+            or os.environ.get("OPENAI_MODEL", "gpt-4o")
+        )
+
+        client = OpenAI(api_key=api_key, base_url=base_url)
+
+        # Build prompt
+        if prompt_override:
+            prompt_content = prompt_override
+        else:
+            prompt_path = self._resolve_prompt_path()
+            prompt_content = prompt_path.read_text(encoding="utf-8")
+
+        messages: list[dict[str, str]] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": prompt_content})
+
+        try:
+            text_parts: list[str] = []
+            input_tokens = 0
+            output_tokens = 0
+
+            # Session init event
+            event = create_session_init_event(
+                stage=self.name,
+                session_id="openai_sdk",
+                tools=[],
+            )
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            stream = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=8192,
+                temperature=0.1,
+                stream=True,
+                stream_options={"include_usage": True},
+            )
+
+            for chunk in stream:
+                # Usage is provided in the final chunk when stream_options include_usage=True
+                if chunk.usage:
+                    input_tokens = chunk.usage.prompt_tokens or 0
+                    output_tokens = chunk.usage.completion_tokens or 0
+
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                text = delta.content or ""
+                if not text:
+                    continue
+
+                text_parts.append(text)
+                event = create_text_delta_event(
+                    stage=self.name,
+                    text=text,
+                    cumulative_text="".join(text_parts),
+                    token_index=len(text_parts),
+                )
+                if event_collector:
+                    event_collector.on_event(event)
+                yield event
+
+            # Fallback token estimate if API didn't return usage
+            if input_tokens == 0 and output_tokens == 0:
+                input_tokens = self._estimate_tokens(prompt_content)
+                output_tokens = self._estimate_tokens("".join(text_parts))
+
+            event = create_metrics_event(
+                stage=self.name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            event = create_stream_end_event(stage=self.name, success=True, duration_ms=0)
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            output = "".join(text_parts)
+            self._last_token_usage = input_tokens + output_tokens
+
+            yield AgentResult(
+                success=True,
+                stage=self.name,
+                raw_output=output,
+                metrics={
+                    "token_usage": self._last_token_usage,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            )
+
+        except Exception as e:
+            event = create_error_event(stage=self.name, error=str(e))
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            event = create_stream_end_event(stage=self.name, success=False, error_message=str(e))
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            raise LLMInvocationError(f"OpenAI-compatible API streaming failed: {e}")
+
+    def _call_llm_langchain_streaming(
+        self,
+        context: dict[str, Any],  # noqa: ARG002 — kept for interface symmetry; callers pass rendered prompt via prompt_override
+        prompt_override: str | None,
+        system_prompt: str | None,
+        event_collector: EventCollector | None,
+    ) -> Generator[LLMEvent | AgentResult, None, None]:
+        """Call LLM using LangChain with streaming.
+
+        This implementation uses LangChain's callback system to receive
+        real-time events during LLM execution.
+        """
+        try:
+            from langchain_anthropic import ChatAnthropic
+            from langchain_core.callbacks import BaseCallbackHandler
+            from langchain_core.prompts import ChatPromptTemplate
+        except ImportError:
+            raise LLMInvocationError(
+                "langchain packages not installed. Run: pip install langchain-core langchain-anthropic"
+            )
+
+        # Read prompt
+        if prompt_override:
+            prompt_content = prompt_override
+        else:
+            prompt_path = self._resolve_prompt_path()
+            prompt_content = prompt_path.read_text(encoding="utf-8")
+
+        # Create custom callback handler for events
+        class ObservabilityCallback(BaseCallbackHandler):
+            def __init__(self, stage: str, collector: EventCollector | None):
+                self.stage = stage
+                self.collector = collector
+                self.text_parts = []
+                self.tool_calls = 0
+
+            def on_llm_start(self, serialized, prompts, **kwargs):
+                event = create_session_init_event(
+                    stage=self.stage,
+                    session_id="langchain",
+                    tools=[],
+                )
+                if self.collector:
+                    self.collector.on_event(event)
+
+            def on_llm_new_token(self, token: str, **kwargs):
+                self.text_parts.append(token)
+                event = create_text_delta_event(
+                    stage=self.stage,
+                    text=token,
+                    cumulative_text="".join(self.text_parts),
+                    token_index=len(self.text_parts),
+                )
+                if self.collector:
+                    self.collector.on_event(event)
+
+            def on_tool_start(self, serialized, input_str, **kwargs):
+                self.tool_calls += 1
+                event = create_tool_start_event(
+                    stage=self.stage,
+                    tool_name=serialized.get("name", "unknown"),
+                    tool_input={"input": input_str},
+                    call_id=str(self.tool_calls),
+                )
+                if self.collector:
+                    self.collector.on_event(event)
+
+            def on_tool_end(self, output, **kwargs):
+                event = create_tool_complete_event(
+                    stage=self.stage,
+                    call_id=str(self.tool_calls),
+                    tool_output={"output": str(output)},
+                )
+                if self.collector:
+                    self.collector.on_event(event)
+
+        # Initialize callback
+        callback = ObservabilityCallback(self.name, event_collector)
+
+        # Initialize model
+        model = ChatAnthropic(
+            model=os.environ.get("VERIFLOW_MODEL", "claude-sonnet-4-6"),
+            temperature=0.1,
+            max_tokens=4096,
+            callbacks=[callback],
+            streaming=True,
+        )
+
+        # Create prompt
+        messages = [("human", prompt_content)]
+        if system_prompt:
+            messages.insert(0, ("system", system_prompt))
+
+        prompt = ChatPromptTemplate.from_messages(messages)
+
+        # Execute with streaming
+        try:
+            chain = prompt | model
+            result_content = chain.invoke({})
+
+            # Extract text content
+            output_text = str(result_content.content) if hasattr(result_content, "content") else str(result_content)
+
+            # Send metrics event (estimate tokens)
+            input_tokens = self._estimate_tokens(prompt_content)
+            output_tokens = self._estimate_tokens(output_text)
+            self._last_token_usage = input_tokens + output_tokens
+
+            event = create_metrics_event(
+                stage=self.name,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+            )
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            # Send stream end event
+            event = create_stream_end_event(
+                stage=self.name,
+                success=True,
+            )
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            # Return final result
+            result = AgentResult(
+                success=True,
+                stage=self.name,
+                raw_output=output_text,
+                metrics={
+                    "token_usage": self._last_token_usage,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+            )
+            yield result
+
+        except Exception as e:
+            # Send error event
+            event = create_error_event(
+                stage=self.name,
+                error=str(e),
+            )
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            # Send stream end with error
+            event = create_stream_end_event(
+                stage=self.name,
+                success=False,
+                error_message=str(e),
+            )
+            if event_collector:
+                event_collector.on_event(event)
+            yield event
+
+            raise LLMInvocationError(f"LangChain streaming failed: {e}")
+
+    # === End of Streaming Methods ===

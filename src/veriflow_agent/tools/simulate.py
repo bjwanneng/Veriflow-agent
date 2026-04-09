@@ -9,8 +9,8 @@ Parses PASS/FAIL from simulation output.
 
 from __future__ import annotations
 
-import tempfile
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -99,7 +99,7 @@ class VvpTool(BaseTool):
                 errors=["iverilog or vvp not found"],
             )
 
-        cwd_path = Path(cwd) if cwd else Path(".")
+        cwd_path = Path(cwd).resolve() if cwd else Path(".").resolve()
         env = get_eda_env()
 
         # Create temp .vvp file
@@ -166,11 +166,12 @@ class VvpTool(BaseTool):
 
         pass_count = sum(
             1 for line in output.splitlines()
-            if "pass" in line.lower() and "fail" not in line.lower()
+            if re.search(r'\bpass\b', line, re.IGNORECASE)
+            and not re.search(r'\bfail\b', line, re.IGNORECASE)
         )
         fail_count = sum(
             1 for line in output.splitlines()
-            if "fail" in line.lower()
+            if re.search(r'\bfail\b', line, re.IGNORECASE)
         )
         all_passed = "all tests passed" in output.lower()
 

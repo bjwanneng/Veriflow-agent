@@ -2,9 +2,7 @@
 
 import json
 import shutil
-import tempfile
 from pathlib import Path
-from typing import Generator
 
 import pytest
 

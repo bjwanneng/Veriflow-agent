@@ -398,14 +398,14 @@ def _build_interface() -> gr.Blocks:
 
                 gr.HTML("<h3>Settings</h3>")
                 llm_backend = gr.Dropdown(
-                    choices=["claude_cli", "anthropic", "openai"],
-                    value="claude_cli",
+                    choices=["openai"],
+                    value="openai",
                     label="LLM Backend",
                     elem_classes=["vf-select"],
                     interactive=True,
                 )
                 api_key_input = gr.Textbox(
-                    placeholder="API Key (optional for claude_cli)",
+                    placeholder="API Key",
                     label="API Key",
                     type="password",
                     elem_classes=["vf-input"],
@@ -493,10 +493,10 @@ def _build_interface() -> gr.Blocks:
             history = history + [{"role": "user", "content": message}]
             yield history, sid, _build_sidebar_stages_html(), '<div style="color:#3b4261;font-size:12px;padding:8px 10px;">No files yet</div>'
 
-            # Stream response
+            # Stream response — accumulate incremental chunks
             full_response = ""
             for chunk in _handler.handle_message(message, history, sid):
-                full_response = chunk
+                full_response += chunk
                 sidebar_html = _update_stages_from_response(full_response)
                 files = _update_files_from_session(sid)
                 history_updated = history + [{"role": "assistant", "content": full_response}]
@@ -552,9 +552,11 @@ def _update_stages_from_response(response: str) -> str:
 
     for stage_id, patterns in stage_patterns.items():
         for pat in patterns:
-            if f"{pat}** — PASSED" in response or f"PASSED" in response and pat in response.lower():
+            # Use precise "PAT** — PASSED/FAILED" markers emitted by formatters.py
+            # to avoid false positives from LLM text that contains these words.
+            if f"{pat}** — PASSED" in response:
                 stage_status[stage_id] = "pass"
-            elif f"{pat}** — FAILED" in response or f"FAILED" in response and pat in response.lower():
+            elif f"{pat}** — FAILED" in response:
                 stage_status[stage_id] = "fail"
 
     # Running stage: find the last mentioned stage that isn't complete
@@ -584,7 +586,7 @@ def _update_stages_from_response(response: str) -> str:
 
 def _update_files_from_session(session_id: str) -> str:
     """Check if the handler has generated files for this session."""
-    project_dir = _handler._project_dirs.get(session_id)
+    project_dir = _handler.get_project_dir(session_id)
     if not project_dir or not project_dir.exists():
         return '<div style="color:#3b4261;font-size:12px;padding:8px 10px;">No files yet</div>'
 
@@ -617,10 +619,10 @@ def launch_chat(
     """
     demo = _build_interface()
 
-    print(f"\n  VeriFlow-Agent Chat UI")
+    print("\n  VeriFlow-Agent Chat UI")
     print(f"  Local:   http://localhost:{port}")
     if share:
-        print(f"  Share:   (Gradio public URL will be generated)")
+        print("  Share:   (Gradio public URL will be generated)")
     print()
 
     demo.launch(

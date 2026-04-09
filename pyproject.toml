@@ -22,10 +22,13 @@ dependencies = [
     "click>=8.0",
     "pyyaml>=6.0",
     "rich>=13.0",
-    "streamlit>=1.28.0",
     "watchdog>=3.0",
     "gradio>=4.0",
-    "textual>=3.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "websockets>=12.0",
+    "python-telegram-bot>=21.0",
+    "openai>=1.0",
 ]
 
 [project.optional-dependencies]
@@ -44,7 +47,7 @@ veriflow-agent = "veriflow_agent.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-veriflow_agent = ["prompts/*.md", "tui/*.tss"]
+veriflow_agent = ["prompts/*.md", "gateway/static/*"]
 
 [tool.ruff]
 target-version = "py310"
