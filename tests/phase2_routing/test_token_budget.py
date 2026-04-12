@@ -24,7 +24,7 @@ class TestTokenBudgetBasic:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 500
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
@@ -34,7 +34,7 @@ class TestTokenBudgetBasic:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 790
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
@@ -44,7 +44,7 @@ class TestTokenBudgetBasic:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 800
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert "warning" in msg.lower()
@@ -55,7 +55,7 @@ class TestTokenBudgetBasic:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 900
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert "warning" in msg.lower()
@@ -65,38 +65,49 @@ class TestTokenBudgetBasic:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 990
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert "warning" in msg.lower()
 
     def test_at_100_percent_exceeded(self):
-        """Test that 100% usage is exceeded."""
+        """Test that 100% usage triggers economy mode (not critical)."""
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 1000
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
-        assert ok is False
-        assert "exceeded" in msg.lower()
+        # At 100% we now allow continuation in economy mode
+        assert ok is True
+        assert "exceeded" in msg.lower() or "warning" in msg.lower()
 
     def test_over_100_percent_exceeded(self):
-        """Test that over 100% usage is exceeded."""
+        """Test that over 100% usage is economy mode."""
+        state = create_initial_state("/tmp", token_budget=1000)
+        state["token_usage"] = 1100
+
+        ok, msg, mode = check_token_budget(state)
+
+        # 110% is still economy mode (under 120%)
+        assert ok is True
+
+    def test_at_120_percent_critical(self):
+        """Test that 120%+ usage triggers critical mode."""
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 1200
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is False
-        assert "exceeded" in msg.lower()
-        assert "1200" in msg or "120%" in msg
+        assert "severely exceeded" in msg.lower()
+        assert mode == "critical"
 
     def test_zero_budget_always_ok(self):
         """Test that zero budget always passes."""
         state = create_initial_state("/tmp", token_budget=0)
         state["token_usage"] = 999999
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
@@ -106,7 +117,7 @@ class TestTokenBudgetBasic:
         state = create_initial_state("/tmp", token_budget=-100)
         state["token_usage"] = 999999
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
@@ -161,17 +172,17 @@ class TestTokenBudgetInRouting:
         state["skill_d_output"] = None
         state["retry_count"] = {"lint": 0, "sim": 0, "synth": 0}
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
 
     def test_budget_check_blocks_when_exceeded(self):
-        """Test that budget check blocks when exceeded."""
+        """Test that budget check blocks when severely exceeded."""
         state = create_initial_state("/tmp", token_budget=10000)
-        state["token_usage"] = 15000  # 150% - Exceeded
+        state["token_usage"] = 15000  # 150% - Critical
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is False
         assert "exceeded" in msg.lower()
@@ -181,7 +192,7 @@ class TestTokenBudgetInRouting:
         state = create_initial_state("/tmp", token_budget=10000)
         state["token_usage"] = 7500  # 75% - OK
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == "" or "warning" in msg.lower()
@@ -195,7 +206,7 @@ class TestTokenBudgetEdgeCases:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 0
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
@@ -205,7 +216,7 @@ class TestTokenBudgetEdgeCases:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 800  # Exactly 80%
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         # At 80% should be warning
         assert ok is True
@@ -216,27 +227,28 @@ class TestTokenBudgetEdgeCases:
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 799  # Just under 80%
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is True
         assert msg == ""
 
     def test_just_over_100_percent(self):
-        """Test just over 100% boundary."""
+        """Test just over 100% boundary — economy mode, not critical."""
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 1001  # Just over 100%
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
-        assert ok is False
-        assert "exceeded" in msg.lower()
+        # 100.1% is economy mode, not critical — pipeline continues
+        assert ok is True
+        assert mode == "economy"
 
     def test_very_large_token_usage(self):
         """Test with very large token usage."""
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 1000000  # 1000x budget
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
         assert ok is False
         assert "exceeded" in msg.lower()
@@ -246,6 +258,7 @@ class TestTokenBudgetEdgeCases:
         state = create_initial_state("/tmp", token_budget=1)
         state["token_usage"] = 1
 
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
 
-        assert ok is False  # 100% = exceeded
+        # 100% of budget=1 is economy mode now (not critical)
+        assert ok is True  # Economy mode, not critical at exactly 100%

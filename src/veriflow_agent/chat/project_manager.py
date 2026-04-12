@@ -67,7 +67,7 @@ def _generate_slug(text: str) -> str:
 
     Examples:
         "Design a 4-bit ALU" -> "alu_design"
-        "Create a UART transmitter" -> "uart_transmitter"
+        "Create a RISC-V core" -> "riscv_core"
     """
     # Take first line, truncate
     first_line = text.strip().split("\n")[0][:60]

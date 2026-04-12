@@ -16,6 +16,8 @@ This is quick mode. Do NOT ask questions. Analyze the requirements and make reas
 ## Project Directory
 {{PROJECT_DIR}}
 
+{{CONTEXT_DOCS}}
+
 ## Output
 You MUST output a complete JSON specification enclosed in ```json ... ``` code fences.
 

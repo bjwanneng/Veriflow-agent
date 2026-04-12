@@ -50,7 +50,7 @@ class IverilogTool(BaseTool):
     Usage:
         tool = IverilogTool()
         if tool.validate_prerequisites():
-            result = tool.run(mode="lint", files=["rtl/top.v", "rtl/alu.v"])
+            result = tool.run(mode="lint", files=["rtl/top.v", "rtl/module_a.v"])
             lint = tool.parse_lint_output(result)
     """
 
@@ -92,7 +92,8 @@ class IverilogTool(BaseTool):
         cmd = [self.executable]
 
         if mode == "lint":
-            cmd.extend(["-Wall", "-tnull"])
+            # Enable all warnings and additional style checks
+            cmd.extend(["-Wall", "-Wimplicit", "-Wportbind", "-Wselect-range", "-tnull"])
         elif mode == "compile":
             if not output_file:
                 return ToolResult(

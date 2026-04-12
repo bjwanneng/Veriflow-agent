@@ -24,6 +24,7 @@ STAGE_LABELS = {
     "sim": "Simulation",
     "synth": "Synthesis",
     "debugger": "Debugger",
+    "supervisor": "Intelligent Routing",
 }
 
 STATUS_ICONS = {
@@ -146,6 +147,40 @@ def format_debugger_event(
         f"| Error type | {error_category or 'analyzing...'} |\n"
         f"| Rollback target | {target_label} |\n\n"
         f"Debugger is analyzing errors and applying fixes...\n"
+    )
+
+
+def format_supervisor_event(
+    decision: dict[str, Any],
+    call_count: int,
+    max_calls: int,
+) -> str:
+    """Format a Supervisor routing decision for display."""
+    action = decision.get("action", "unknown")
+    target = decision.get("target_stage", "")
+    hint = decision.get("hint", "")
+    root_cause = decision.get("root_cause", "")
+    severity = decision.get("severity", "medium")
+
+    target_label = STAGE_LABELS.get(target, target)
+    severity_icon = {"low": "low", "medium": "med", "high": "HIGH"}.get(severity, "?")
+    action_display = {
+        "retry_stage": "Retry with fix",
+        "escalate_stage": "Escalate to earlier stage",
+        "continue": "Continue (non-critical)",
+        "abort": "Abort pipeline",
+    }.get(action, action)
+
+    return (
+        f"\n---\n"
+        f"**[BRAIN] Supervisor Decision ({call_count}/{max_calls})**\n\n"
+        f"| Field | Value |\n"
+        f"|-------|-------|\n"
+        f"| Action | {action_display} |\n"
+        f"| Target stage | {target_label} |\n"
+        f"| Severity | {severity_icon} |\n"
+        f"| Root cause | {root_cause[:150]} |\n"
+        f"| Hint | {hint[:150]} |\n\n"
     )
 
 

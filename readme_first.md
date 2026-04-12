@@ -47,6 +47,20 @@ Veriflow-agent/
 │       │   ├── __init__.py
 │       │   ├── state.py         # VeriFlowState, StageOutput
 │       │   └── graph.py         # StateGraph 组装, 条件路由
+│       ├── chat/                # 对话层
+│       │   ├── handler.py         # PipelineChatHandler (TUI 桥接)
+│       │   ├── orchestrator.py    # OrchestratorAgent (LLM + 工具循环)
+│       │   ├── llm.py             # LLM 后端 (OpenAI tool calling 支持)
+│       │   ├── formatters.py      # State → Markdown 格式化
+│       │   └── project_manager.py # 需求 → 项目目录
+│       ├── context/             # 需求文件扫描
+│       │   ├── __init__.py
+│       │   └── scanner.py         # context/ 目录文档扫描器
+│       ├── tui/                 # Textual TUI
+│       │   ├── app.py             # Rich 终端界面
+│       │   └── ...
+│       ├── gateway/             # WebSocket 网关
+│       │   └── ...
 │       └── tools/               # 工具层
 │           ├── __init__.py
 │           ├── base.py          # BaseTool, ToolResult
@@ -56,7 +70,7 @@ Veriflow-agent/
 │           ├── synth.py         # YosysTool, SynthResult
 │           └── constraint_gen.py # SDC约束生成器
 │
-├── tests/                     # 测试 (77 tests)
+├── tests/                     # 测试 (339 tests)
 │   ├── conftest.py              # 共享 fixture
 │   ├── fixtures/                # 示例项目 (ALU)
 │   ├── test_tools.py            # 工具层测试 (19 tests)
@@ -287,9 +301,9 @@ veriflow-agent lint-stage --stage 3 --project-dir ./my_alu
 
 ---
 
-**最后更新**: 2026-04-08
+**最后更新**: 2026-04-11
 
-**项目状态**: ✅ Phase 1+2+3 全部完成 + **154测试通过** + Chat UI + TUI Client + Code Review 修复完成
+**项目状态**: ✅ Phase 1+2+3 全部完成 + **339测试通过** + Chat UI + TUI Client + Code Review 修复 + **Orchestrator Agent 完成**
 
 ---
 
@@ -509,3 +523,204 @@ src/veriflow_agent/chat/
 - **调试可视化**: Debugger 反馈回路实时展示（重试次数、回退目标、错误类型）
 - **RTL 代码展示**: 自动显示生成的 Verilog 代码
 - **公网分享**: `--share` 参数生成公网 URL
+
+---
+
+## Session 2026-04-11: Code Review + LLM 智能化路线
+
+### 一、Review 发现的问题 (待修复)
+
+#### P0 — 必须立即修复
+
+| # | 问题 | 位置 | 说明 |
+|---|------|------|------|
+| R1 | `_SKIP_PERMS` 默认值不一致 | `llm.py:30` 默认 `"true"` vs `base.py:45` 默认 `"false"` | 同一环境变量两种行为，安全风险 |
+| R2 | 不安全的 JSON 拼接 | `handler.py:523` | `message.replace('"', '\\"')` 不处理 `\n\t\r`，应用 `json.dumps()` |
+| R3 | LLM 决策 JSON 泄露到 UI | `handler.py:716-717` | `_architect_clarification` 把 LLM 内部 JSON yield 给用户 |
+| R4 | 流式重试产生重复/损坏输出 | `llm.py:537-596` | 连接重置后重试，已 yield 的 chunk 丢失，新流从头开始 |
+
+#### P1 — 高优先级
+
+| # | 问题 | 位置 | 说明 |
+|---|------|------|------|
+| R5 | `STAGE_ORDER` / `STAGE_LABELS` 重复定义 | `formatters.py` + `graph.py` | 两处可能不同步 |
+| R6 | `llm.py` 每次调用创建新 OpenAI 客户端 | `llm.py:470-514` | 缺少缓存，而 `base.py` 有 `_openai_client_cache` |
+| R7 | `_consume_streaming` 空输出 = 报错 | `base.py:478` | 合法空响应被视为异常 |
+| R8 | `_run_pipeline_partial` 绕过 LangGraph | `handler.py:1413-1624` | 无 debugger 重试、无条件路由 |
+
+#### P2 — 中等优先级
+
+| # | 问题 | 位置 | 说明 |
+|---|------|------|------|
+| R9 | `architect.py:105-108` 临时修改实例属性 | 非线程安全 | 应传参而非 mutate |
+| R10 | `handler.py:236,241` 意图分类长度截断 | `len(msg_lower) < 120` | 长消息绕过检查 |
+| R11 | LangChain streaming 实为阻塞调用 | `base.py:1140-1143` | `chain.invoke({})` 不是真正的流 |
+| R12 | 死代码: claude_cli 200+ 行 | `base.py:480-885` | 后端已禁用但代码未删 |
+| R13 | `state.py:306` 未命名 lambda | 可读性差 | 应提取为命名函数 |
+| R14 | `handler.py` 过长 1600+ 行 | 可维护性 | 应拆分为 3 个模块 |
+| R15 | `Any` 类型过度使用 | `handler.py` 多处 | `event_callback` 应定义为 Protocol |
+
+### 二、LLM 智能化路线 (待实施)
+
+**核心诉求**: Agent 要智能，客户是主控，和客户对话的是智能 LLM，感知客户需求，修改既定流程/路由。
+
+#### 6 个机械决策点 → LLM 智能决策
+
+| # | 决策点 | 当前（机械） | 目标（智能） |
+|---|--------|-------------|-------------|
+| L1 | 意图识别 | 关键词表 `_DESIGN_SIGNALS` 等 40+ 词 | LLM 语义理解 |
+| L2 | 错误分类 | 正则 20+ 模式匹配 | LLM 读错误日志理解根因 |
+| L3 | 回滚路由 | `if SYNTAX→coder` 查表 | LLM 根据上下文决定修哪里 |
+| L4 | Step 暂停响应 | 检查 `"重试"/"retry"` 关键词 | LLM 理解用户真正想做什么 |
+| L5 | Pipeline 阶段选择 | 固定 8 阶段 3 模式 | LLM 根据复杂度动态选阶段 |
+| L6 | 增量重跑 | 绕过 LangGraph 手动调 node | LLM 决策 + 动态子图 |
+
+#### 待定方案
+
+- 渐进式改造: 保留 LangGraph，逐个替换为 LLM 调用
+- 完全重构: 单一 LLM 对话循环
+- 混合架构: LLM 高层决策 + 程序低层执行
+
+### 三、Review 修复记录 (2026-04-11)
+
+| # | 问题 | 状态 | 修改文件 |
+|---|------|------|---------|
+| R1 | `_SKIP_PERMS` 默认统一为 `"false"` | ✅ | `chat/llm.py` |
+| R2 | JSON 拼接改用 `json.dumps()` | ✅ | `chat/handler.py` |
+| R3 | LLM 决策 JSON 不再泄露到 UI | ✅ | `chat/handler.py` |
+| R4 | 流式重试改为循环重试完整请求 | ✅ | `chat/llm.py` |
+| R5 | `STAGE_ORDER`/`STAGE_LABELS` 单一来源 (lazy import 避免循环) | ✅ | `graph/graph.py` |
+| R6 | `llm.py` 添加客户端缓存 | ✅ | `chat/llm.py` |
+| R7 | `_consume_streaming` 允许空但有内容的流 | ✅ | `agents/base.py` |
+| R8 | 移除 200+ 行废弃 `claude_cli` 代码 | ✅ | `agents/base.py`, `chat/llm.py` |
+| R9 | `_resolve_prompt_path` 接受参数，不再 mutate self | ✅ | `agents/base.py`, `agents/architect.py` |
+| R11 | 移除 `timing.py` 冗余 `import re` | ✅ | `agents/timing.py` |
+| R13 | 提取 lambda 为命名函数 `_dedupe_extend`/`_extend_events` | ✅ | `graph/state.py` |
+
+测试: 339/339 通过 (包含 orchestrator、tool calling、fallback 测试)
+
+---
+
+## Session 2026-04-11: LLM 智能化改造 (Phase 1)
+
+### 核心理念
+
+**混合架构**: LLM 做高层决策（意图识别、错误分析），程序做低层执行（EDA 工具、文件写入）。机械代码保留为 LLM 失败时的 fallback。
+
+### L1: 统一意图识别 — LLM 优先 ✅
+
+**改造前**: `_classify_intent()` 用关键词表 (`_INSPECT_KEYWORDS` / `_MODIFY_KEYWORDS` / `_DESIGN_SIGNALS`) 做预过滤，匹配的走快路径，不匹配的才走 LLM。
+
+**改造后**: 所有消息统一走 `_handle_llm_driven()`，LLM 返回 `mode: "design" | "chat" | "inspect" | "modify"` 四种意图。关键词表 (`_INSPECT_KEYWORDS` / `_MODIFY_KEYWORDS`) 保留为 fallback，仅在 LLM 调用失败时使用。`_DESIGN_SIGNALS` 已删除（死代码）。
+
+**修改文件**:
+- `src/veriflow_agent/chat/handler.py`
+  - `_classify_intent()` 始终返回 `"llm_analyze"`
+  - 新增 `_classify_intent_fallback()` 静态方法（关键词 fallback）
+  - 扩展 LLM prompt schema: 增加 `inspect`/`modify` mode + `target_files` 字段
+  - `_handle_llm_driven()` dispatch 增加 `inspect`/`modify` 分支
+  - LLM fallback 和 JSON parse fallback 使用关键词分类
+  - 项目目录创建推迟到 design mode 确认后（避免 inspect/modify 被空 tempdir 干扰）
+- `tests/test_chat.py`
+  - 更新 3 个 intent 测试（inspect/modify 现在返回 `llm_analyze`）
+  - 新增 3 个 fallback 测试
+
+### L2: LLM 错误分析 + 智能回滚路由 ✅
+
+**改造前**: `categorize_error()` 用 20+ 正则模式匹配错误类型，`get_rollback_target()` 用 if/elif 查表决定回滚目标。在 `node_lint/node_sim/node_synth` 中机械执行。
+
+**改造后**: Debugger 节点修复 RTL 后，额外调用 LLM 分析错误根因。LLM 返回结构化 JSON: `{"error_category", "rollback_target", "reasoning", "fix_strategy"}`。`node_debugger()` 用 LLM 结果覆盖机械分类的 `target_rollback_stage`。
+
+**设计决策**:
+- 机械版本 (`categorize_error()` + `get_rollback_target()`) **保留**作为 `node_lint/node_sim/node_synth` 中的初始默认值
+- LLM 分析仅在 `node_debugger` 中触发（debugger 已经调用 LLM，增量成本低）
+- LLM 分析失败时不影响流程，机械目标作为 fallback
+
+**修改文件**:
+- `src/veriflow_agent/agents/debugger.py`
+  - 新增 `_analyze_error_with_llm()` 方法
+  - LLM 分析结果写入 `AgentResult.metrics` (`llm_error_category`, `llm_rollback_target`, `llm_error_reasoning`, `llm_fix_strategy`)
+- `src/veriflow_agent/graph/graph.py`
+  - `node_debugger()` 读取 LLM 分析结果，覆盖 `target_rollback_stage`
+  - 日志记录 mechanical → LLM 的目标变化
+
+### 测试结果
+
+339 passed, 2 skipped (8.72s)
+
+### 暂缓项 (V2)
+
+| 项目 | 理由 |
+|------|------|
+| L3: 去掉 retry 关键词 | 仅 7 个关键词，ROI 不够 |
+| L4: 动态阶段选择 | 等真实用户场景 |
+| L5: LangGraph 原生增量重跑 | 核心流程重写，风险高 |
+| L6: 共享 LLM decider | 等重复代码积累后再抽象 |
+
+### 热修复: LLM 调用挂死问题 ✅
+
+**现象**: 用户说 "帮我写verilog代码，需求在目录下面" 时，LLM 调用挂死在 "正在调用 LLM 分析 (尝试 1/5)…"，无法进入流水线。
+
+**根因** (3 个叠加):
+1. **OpenAI 客户端无 timeout**: `_make_openai_client()` 创建 `OpenAI()` 未传 timeout，默认 600 秒。网络慢或连接静默断开时等 10 分钟才超时。
+2. **线程竞争**: `nonlocal response_text` 被多个重试线程并发写入，无同步机制。
+3. **孤儿线程**: `join(timeout=120)` 超时后线程继续运行，重试时新线程与旧线程同时写 `response_text`。
+
+**修复**:
+- `chat/llm.py`: `OpenAI()` 添加 `timeout=120.0`
+- `chat/handler.py`: 用 `queue.Queue` 替代 `nonlocal` 线程间通信；线程设为 `daemon=True`；重试次数从 5 降为 3；超时从 120s 降为 90s
+
+### L1+L2 升级: Orchestrator Agent (OpenAI Tool Calling) ✅
+
+**问题**: 与用户对话的是一个"分类器" — 先用 LLM 返回 JSON mode，再分发给不同处理器。用户期望：**跟他对话的是一个能感知项目状态、有工具可调、能自主决策的 Agent**。
+
+**解决方案**: 用 **OpenAI tool calling（函数调用）** 替代"分类 → 分发"模式。LLM 不再只返回 mode JSON，而是通过 tool calling 主动调用工具（读文件、启动 pipeline、查看状态等），在对话循环中完成一切。
+
+#### 架构
+
+```
+用户 ⟷ OrchestratorAgent (LLM + 工具循环)
+  │
+  ├── 工具: start_pipeline(requirement, use_context_files)
+  │     → 写入 requirement.md → 调用 LangGraph pipeline
+  ├── 工具: read_file(path)
+  │     → 读取项目中的文件（RTL、spec、报告等）
+  ├── 工具: list_files(directory)
+  │     → 列出目录内容
+  ├── 工具: get_project_status()
+  │     → 返回项目当前状态（阶段、文件、错误）
+  ├── 工具: update_requirement(modification)
+  │     → 更新需求并重新运行 pipeline
+  ├── 工具: scan_context_files()
+  │     → 扫描 context/ 目录的参考文档
+  │
+  └── 子系统: LangGraph pipeline（被 start_pipeline 调用，不变）
+```
+
+#### Agent 循环
+
+```
+1. 收到用户消息 + 对话历史 + 项目状态
+2. 调用 LLM（带 tools 参数）
+3. LLM 返回:
+   a. tool_calls → 执行工具，把结果喂回 LLM → 回到 2
+   b. 纯文本 → yield 给用户 → 结束
+4. 循环最多 10 轮（防无限循环）
+```
+
+#### 文件变更
+
+| 文件 | 动作 | 说明 |
+|------|------|------|
+| `src/veriflow_agent/chat/llm.py` | 修改 | `call_llm_stream` + `_stream_openai` 增加 `tools` 参数；流式 tool call 累积 |
+| `src/veriflow_agent/chat/orchestrator.py` | **新建** | `OrchestratorAgent` 类 + 6 个工具 schema + 执行函数 |
+| `src/veriflow_agent/chat/handler.py` | 修改 | `handle_message()` 委托给 `OrchestratorAgent.run()` |
+| `tests/test_chat.py` | 修改 | 更新 test_new_design_creates_project 适配 orchestrator |
+
+**不变**: TUI (`tui/app.py`) — generator 接口不变；LangGraph pipeline (`graph/`) — 被 start_pipeline 调用，不变；Agent 层 (`agents/`) 不变。
+
+#### 验证
+
+- 339/339 tests passing
+- `handle_message()` 接口签名完全不变，TUI 无感切换
+- LLM 决策失败时 fallback 到关键词分类（保留 `_classify_intent_fallback`）

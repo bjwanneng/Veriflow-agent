@@ -30,7 +30,7 @@ class TimingAgent(BaseAgent):
                 "workspace/tb/tb_*.v",
             ],
             max_retries=1,
-            llm_backend="openai",
+            llm_backend="claude_cli",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -66,6 +66,9 @@ class TimingAgent(BaseAgent):
         }
 
         # Step 4: Invoke LLM (with streaming if EventCollector available)
+        # NOTE: Timing agent generates BOTH yaml and verilog, so we need the FULL
+        # markdown output (with code fences) to extract both files correctly.
+        # Using output_extractor would merge yaml+verilog content, breaking extraction.
         try:
             prompt = self.render_prompt(llm_context)
 
@@ -116,53 +119,91 @@ class TimingAgent(BaseAgent):
             raw_output=llm_output[:2000],
         )
 
-    def _write_timing_artifacts(self, project_dir: Path, llm_output: str) -> None:
-        """Parse LLM output and write timing_model.yaml and testbench files.
 
-        If the files are not already written by the LLM, this method extracts
-        the YAML and Verilog content from the LLM output and writes them.
-        """
-        import re
+    def _write_timing_artifacts(self, project_dir: Path, llm_output: str) -> None:
+        """Parse LLM output and write timing_model.yaml and testbench files."""
+        import logging
+
+        logger = logging.getLogger("veriflow")
 
         docs_dir = project_dir / "workspace" / "docs"
         tb_dir = project_dir / "workspace" / "tb"
         docs_dir.mkdir(parents=True, exist_ok=True)
         tb_dir.mkdir(parents=True, exist_ok=True)
 
-        # Check if timing_model.yaml already exists (LLM may have written it)
+        # ── Extract timing_model.yaml ─────────────────────────────────────────
         timing_path = docs_dir / "timing_model.yaml"
-        if not timing_path.exists():
-            # Try to extract YAML content from LLM output
-            # Look for YAML between ```yaml and ``` markers
-            yaml_match = re.search(
-                r'```(?:yaml|yml)?\s*\n(.*?)\n```',
+        yaml_content = None
+
+        # Pattern 1: Standard ```yaml or ```yml blocks
+        yaml_match = re.search(
+            r'```(?:yaml|yml)\s*\n(.*?)\n```',
+            llm_output,
+            re.DOTALL | re.IGNORECASE
+        )
+        if yaml_match:
+            yaml_content = yaml_match.group(1).strip()
+            logger.debug("Extracted YAML from ```yaml block")
+
+        # Pattern 2: Content starting with "design:" (inline YAML)
+        if not yaml_content:
+            yaml_inline = re.search(
+                r'(design:\s*\w+.*?)(?=\n```|\n\n\n|```\w+|$)',
                 llm_output,
                 re.DOTALL | re.IGNORECASE
             )
-            if yaml_match:
-                yaml_content = yaml_match.group(1).strip()
-                timing_path.write_text(yaml_content, encoding="utf-8")
+            if yaml_inline:
+                yaml_content = yaml_inline.group(1).strip()
+                logger.debug("Extracted inline YAML")
 
-        # Check for testbench files in output
-        # Look for Verilog testbench between ```verilog and ``` markers
+        # Write YAML (always overwrite)
+        if yaml_content and len(yaml_content) > 50:
+            timing_path.write_text(yaml_content, encoding="utf-8")
+            logger.info(f"Written timing_model.yaml ({len(yaml_content)} chars)")
+        else:
+            logger.warning(f"Could not extract valid YAML content")
+            timing_path.write_text(f"# Error: Could not parse timing_model.yaml\n", encoding="utf-8")
+
+        # ── Extract testbench files ────────────────────────────────────────────
         tb_matches = re.findall(
-            r'```(?:verilog|v)?\s*\n(.*?)\n```',
+            r'```(?:verilog|v)\s*\n(.*?)\n```',
             llm_output,
             re.DOTALL | re.IGNORECASE
         )
 
+        tb_written = 0
         for i, verilog_content in enumerate(tb_matches):
             content = verilog_content.strip()
-            # Only save if it looks like a testbench (contains 'module' and 'testbench' keywords)
-            if 'module' in content.lower() and ('test' in content.lower() or 'tb_' in content.lower()):
-                # Try to extract module name
-                module_match = re.search(r'module\s+(\w+)', content, re.IGNORECASE)
-                if module_match:
-                    module_name = module_match.group(1)
-                    safe_name = re.sub(r'[^a-zA-Z0-9_]', '', module_name) or "unnamed"
-                else:
-                    safe_name = f"tb_generated_{i}"
+            if not content:
+                continue
 
-                tb_path = tb_dir / f"{safe_name}.v"
-                if not tb_path.exists():
-                    tb_path.write_text(content, encoding="utf-8")
+            # Check if it looks like a testbench
+            is_testbench = (
+                'module' in content.lower() and
+                ('initial' in content.lower() or
+                 'tb_' in content.lower() or
+                 '$display' in content or
+                 '$finish' in content)
+            )
+
+            if not is_testbench:
+                continue
+
+            # Extract module name
+            module_match = re.search(r'module\s+(\w+)', content, re.IGNORECASE)
+            if module_match:
+                module_name = module_match.group(1)
+                safe_name = re.sub(r'[^a-zA-Z0-9_]', '', module_name) or f"tb_{i}"
+            else:
+                safe_name = f"tb_generated_{i}"
+
+            if not safe_name.startswith("tb_"):
+                safe_name = f"tb_{safe_name}"
+
+            tb_path = tb_dir / f"{safe_name}.v"
+            tb_path.write_text(content, encoding="utf-8")
+            tb_written += 1
+            logger.info(f"Written testbench: {safe_name}.v")
+
+        if tb_written == 0:
+            logger.warning(f"No testbench found in LLM output")

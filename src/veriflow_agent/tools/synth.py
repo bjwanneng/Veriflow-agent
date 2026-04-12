@@ -57,7 +57,7 @@ class YosysTool(BaseTool):
         tool = YosysTool()
         if tool.validate_prerequisites():
             result = tool.run(
-                rtl_files=["rtl/top.v", "rtl/alu.v"],
+                rtl_files=["rtl/top.v", "rtl/module_a.v"],
                 top_module="top",
             )
             synth = tool.parse_synth_output(result, top_module="top")

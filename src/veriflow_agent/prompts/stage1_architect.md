@@ -12,6 +12,8 @@ You are running in **pipeline mode** — this is a single-shot execution with NO
 4. Do NOT ask questions — make reasonable assumptions for any ambiguity
 5. Do NOT output anything besides the spec.json — no summaries, no commentary
 
+{{CONTEXT_DOCS}}
+
 If the requirement is ambiguous, use sensible defaults:
 - Default frequency: {{FREQUENCY_MHZ}} MHz
 - Default data width: 32 bits

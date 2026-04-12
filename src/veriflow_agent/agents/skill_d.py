@@ -46,7 +46,7 @@ class SkillDAgent(BaseAgent):
             required_inputs=["workspace/rtl/*.v"],
             output_artifacts=["workspace/docs/quality_report.json"],
             max_retries=1,
-            llm_backend="openai",
+            llm_backend="claude_cli",
         )
         self.quality_threshold = quality_threshold
 
@@ -84,8 +84,13 @@ class SkillDAgent(BaseAgent):
         static_result = self._run_static_analysis(rtl_files)
         static_score = self._compute_static_score(static_result)
 
-        # Phase 2: LLM pre-check (cheap call)
-        llm_score, llm_issues = self._run_llm_precheck(rtl_files, context)
+        # Phase 2: LLM pre-check (cheap call) — skip in economy mode
+        budget_mode = context.get("budget_mode", "normal")
+        if budget_mode == "economy":
+            logger.info("Skipping LLM pre-check in economy budget mode")
+            llm_score, llm_issues = 0.6, ["LLM pre-check skipped (economy mode)"]
+        else:
+            llm_score, llm_issues = self._run_llm_precheck(rtl_files, context)
 
         # Combined score: weighted average (LLM score weighted higher for better quality judgment)
         combined_score = static_score * 0.3 + llm_score * 0.7
@@ -150,8 +155,30 @@ class SkillDAgent(BaseAgent):
             if tab_lines > len(lines) * 0.5 and len(lines) > 10:
                 issues.append(f"{rtl_file.name}: mixed tabs/spaces")
 
+            # Check for module declaration - must start with 'module ' keyword
             module_pattern = r"module\s+(\w+)\s*\((.*?)\);"
-            for match in re.finditer(module_pattern, content, re.DOTALL):
+            module_matches = list(re.finditer(module_pattern, content, re.DOTALL))
+
+            if not module_matches:
+                # No module declaration found - check if it looks like Verilog code
+                # (has endmodule, always, assign, etc. but missing module keyword)
+                has_verilog_keywords = any(
+                    kw in content for kw in ["endmodule", "always", "assign", "input", "output", "wire", "reg"]
+                )
+                if has_verilog_keywords:
+                    issues.append(
+                        f"{rtl_file.name}: CRITICAL - Missing 'module' keyword at start of file. "
+                        f"File appears to be Verilog code but does not start with 'module ' declaration."
+                    )
+                    # Try to detect what looks like a module name (first identifier followed by '(')
+                    malformed_module = re.search(r"^\s*(\w+)\s*\(", content)
+                    if malformed_module:
+                        issues.append(
+                            f"{rtl_file.name}: HINT - Found '{malformed_module.group(1)}(' at start, "
+                            f"should be 'module {malformed_module.group(1)}('"
+                        )
+
+            for match in module_matches:
                 module_name = match.group(1)
                 ports_str = match.group(2)
                 total_modules += 1
@@ -171,7 +198,18 @@ class SkillDAgent(BaseAgent):
                     "file": rtl_file.name,
                     "ports_count": len(ports),
                     "ports": ports[:10],
+                    "has_endmodule": "endmodule" in content,
                 })
+
+            # Check for missing endmodule (real completeness check, not LLM guess)
+            if ("module " in content or module_matches) and "endmodule" not in content:
+                issues.append(
+                    f"{rtl_file.name}: missing 'endmodule' — file may be truncated"
+                )
+
+            # Check for blocking/non-blocking assignment mixing in sequential blocks
+            blocking_issues = self._check_blocking_assignment_issues(content, rtl_file.name)
+            issues.extend(blocking_issues)
 
         return {
             "total_lines": total_lines,
@@ -180,6 +218,84 @@ class SkillDAgent(BaseAgent):
             "files_analyzed": len(rtl_files),
             "issues": issues,
         }
+
+    def _check_blocking_assignment_issues(
+        self, content: str, filename: str
+    ) -> list[str]:
+        """Check for blocking (=) vs non-blocking (<=) assignment issues.
+
+        Detects common patterns that cause synthesis/simulation mismatches:
+        1. Blocking assignment in sequential always block (clocked)
+        2. Mixed blocking and non-blocking in the same always block
+
+        Returns list of issue descriptions.
+        """
+        issues = []
+        lines = content.split("\n")
+
+        # Track current always block context
+        in_always_block = False
+        always_block_start = 0
+        has_blocking = False
+        has_nonblocking = False
+        is_sequential = False  # Has posedge/negedge sensitivity
+
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+
+            # Detect always block start
+            if re.match(r"\s*always\s*@", stripped):
+                in_always_block = True
+                always_block_start = i
+                has_blocking = False
+                has_nonblocking = False
+                is_sequential = "posedge" in stripped or "negedge" in stripped
+                continue
+
+            if in_always_block:
+                # Check for blocking assignment (= but not ==, <=, or ===)
+                # Pattern: variable = expression (not <=, ==, ===, !=)
+                if re.search(r"(?<![<=!])=(?![=])", stripped):
+                    # Exclude comparisons and non-blocking assignments
+                    if "=" in stripped and "<=" not in stripped:
+                        # Check it's actually an assignment, not a parameter/localparam
+                        if not stripped.startswith(("parameter", "localparam", "//")):
+                            has_blocking = True
+                            if is_sequential:
+                                issues.append(
+                                    f"{filename}:{i+1}: blocking assignment '=' in sequential always block "
+                                    f"(use '<=' for sequential logic)"
+                                )
+
+                # Check for non-blocking assignment
+                if "<=" in stripped and "<<=" not in stripped:
+                    has_nonblocking = True
+
+                # Check for end of always block (simplified - just count begin/end)
+                if "begin" in stripped:
+                    pass  # nested block
+                if stripped == "end" or stripped.startswith("end "):
+                    # Check if this ends the always block
+                    if has_blocking and has_nonblocking:
+                        issues.append(
+                            f"{filename}:{always_block_start+1}: mixed blocking '=' and "
+                            f"non-blocking '<=' assignments in same always block"
+                        )
+                    in_always_block = False
+                    continue
+
+                # Simple heuristic: unblocked assignment end
+                if not stripped.startswith(("if", "else", "case", "for", "while")) and \
+                   stripped.endswith(";") and "begin" not in stripped:
+                    # Single statement always block
+                    if has_blocking and has_nonblocking:
+                        issues.append(
+                            f"{filename}:{always_block_start+1}: mixed blocking '=' and "
+                            f"non-blocking '<=' assignments in same always block"
+                        )
+                    in_always_block = False
+
+        return issues
 
     def _compute_static_score(self, analysis: dict[str, Any]) -> float:
         """Compute a 0-1 quality score from static analysis.
@@ -210,6 +326,10 @@ class SkillDAgent(BaseAgent):
         - Synthesizability issues
         - Code style violations
 
+        IMPORTANT: The prompt explicitly tells the LLM NOT to judge code
+        completeness, because truncation means it may not see the full file.
+        Completeness is checked by _run_static_analysis instead.
+
         Returns:
             Tuple of (score 0-1, list of issue descriptions).
         """
@@ -217,9 +337,14 @@ class SkillDAgent(BaseAgent):
         rtl_content = ""
         for f in rtl_files[:5]:  # Max 5 files
             content = f.read_text(encoding="utf-8")
-            rtl_content += f"\n// --- File: {f.name} ---\n"
-            rtl_content += content[:2000]  # Truncate per file
-        rtl_content = rtl_content[:8000]  # Total cap
+            rtl_content += f"\n// --- File: {f.name} ({len(content.splitlines())} lines) ---\n"
+            # Show up to 3000 chars per file — enough for most modules
+            if len(content) > 3000:
+                rtl_content += content[:3000]
+                rtl_content += f"\n// ... (truncated, {len(content) - 3000} more chars)\n"
+            else:
+                rtl_content += content
+        rtl_content = rtl_content[:10000]  # Total cap
 
         if not rtl_content.strip():
             return 0.5, ["No RTL content to analyze"]
@@ -233,7 +358,15 @@ class SkillDAgent(BaseAgent):
             "4. Multi-driven signals\n"
             "5. Missing resets\n"
             "6. Non-synthesizable constructs\n"
-            "7. Signal width mismatches\n\n"
+            "7. Signal width mismatches\n"
+            "8. **Blocking (=) vs Non-blocking (<=) assignment misuse**:\n"
+            "   - Blocking '=' in sequential (clocked) always blocks → CRITICAL\n"
+            "   - Non-blocking '<=' in combinational always blocks → MINOR\n"
+            "   - Mixed '=' and '<=' in same always block → CRITICAL\n\n"
+            "IMPORTANT: The code below may be truncated. Do NOT penalize for "
+            "incomplete code, missing endmodule, or truncated files — those are "
+            "artifacts of the preview window, not real code issues. Only score "
+            "based on the code you CAN see.\n\n"
             f"RTL Code:\n```\n{rtl_content}\n```\n\n"
             "Respond in this EXACT format:\n"
             "SCORE: <0-100>\n"

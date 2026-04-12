@@ -9,6 +9,7 @@ from langgraph.graph import END
 
 from veriflow_agent.graph.graph import _route_synth
 from veriflow_agent.graph.state import (
+    MAX_SUPERVISOR_CALLS,
     StageOutput,
     create_initial_state,
 )
@@ -56,8 +57,8 @@ class TestSynthRouting:
         # Pipeline ends on successful synth
         assert result == END
 
-    def test_synth_fail_first_retry_routes_to_debugger(self):
-        """Test synth failure on first retry routes to debugger."""
+    def test_synth_fail_first_retry_routes_to_supervisor(self):
+        """Test synth failure on first retry routes to supervisor."""
         state = create_initial_state("/tmp/test")
         state["synth_output"] = StageOutput(
             success=False,
@@ -66,14 +67,15 @@ class TestSynthRouting:
         state["retry_count"] = {"lint": 0, "sim": 0, "synth": 0}
         state["token_usage"] = 100000
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
 
         result = _route_synth(state)
 
-        assert result == "debugger"
+        assert result == "supervisor"
         # Note: feedback_source is now set by node_synth, not the routing function
 
-    def test_synth_fail_timing_violation_routes_to_debugger(self):
-        """Test synth timing violation routes to debugger."""
+    def test_synth_fail_timing_violation_routes_to_supervisor(self):
+        """Test synth timing violation routes to supervisor."""
         state = create_initial_state("/tmp/test")
         state["synth_output"] = StageOutput(
             success=False,
@@ -82,13 +84,14 @@ class TestSynthRouting:
         state["retry_count"] = {"lint": 1, "sim": 1, "synth": 0}
         state["token_usage"] = 120000
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
 
         result = _route_synth(state)
 
-        assert result == "debugger"
+        assert result == "supervisor"
 
-    def test_synth_fail_second_retry_routes_to_debugger(self):
-        """Test synth failure on second retry still routes to debugger."""
+    def test_synth_fail_second_retry_routes_to_supervisor(self):
+        """Test synth failure on second retry still routes to supervisor."""
         state = create_initial_state("/tmp/test")
         state["synth_output"] = StageOutput(
             success=False,
@@ -97,21 +100,40 @@ class TestSynthRouting:
         state["retry_count"] = {"lint": 0, "sim": 1, "synth": 2}
         state["token_usage"] = 150000
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
 
         result = _route_synth(state)
 
-        assert result == "debugger"
+        assert result == "supervisor"
 
-    def test_synth_fail_max_retries_exceeded_ends(self):
-        """Test synth failure after max retries ends pipeline."""
+    def test_synth_fail_max_retries_exceeded_routes_to_supervisor(self):
+        """Test synth failure after max retries routes to supervisor."""
         state = create_initial_state("/tmp/test")
         state["synth_output"] = StageOutput(
             success=False,
             errors=["Unable to meet timing constraints"],
         )
         state["retry_count"] = {"lint": 1, "sim": 2, "synth": 3}  # MAX_RETRIES = 3
+        state["total_retries"] = {"lint": 1, "sim": 2, "synth": 3}
         state["token_usage"] = 200000
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
+
+        result = _route_synth(state)
+
+        assert result == "supervisor"
+
+    def test_synth_fail_supervisor_cap_reached_ends(self):
+        """Test synth failure after supervisor call cap reached ends pipeline."""
+        state = create_initial_state("/tmp/test")
+        state["synth_output"] = StageOutput(
+            success=False,
+            errors=["Unable to meet timing constraints"],
+        )
+        state["retry_count"] = {"lint": 1, "sim": 2, "synth": 3}
+        state["token_usage"] = 200000
+        state["token_budget"] = 1000000
+        state["supervisor_call_count"] = MAX_SUPERVISOR_CALLS
 
         result = _route_synth(state)
 
@@ -131,17 +153,18 @@ class TestSynthRouting:
 
         assert result == END
 
-    def test_synth_no_output_defaults_to_debugger(self):
-        """Test missing synth output routes to debugger."""
+    def test_synth_no_output_defaults_to_supervisor(self):
+        """Test missing synth output routes to supervisor."""
         state = create_initial_state("/tmp/test")
         # synth_output is None
         state["retry_count"] = {"lint": 0, "sim": 0, "synth": 0}
         state["token_usage"] = 0
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
 
         result = _route_synth(state)
 
-        assert result == "debugger"
+        assert result == "supervisor"
         # Note: feedback_source is now set by node_synth, not the routing function
 
     def test_synth_fail_sets_feedback_source(self):
@@ -154,6 +177,7 @@ class TestSynthRouting:
         state["retry_count"] = {"lint": 0, "sim": 0, "synth": 0}
         state["token_usage"] = 50000
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
 
         _route_synth(state)
 
@@ -170,8 +194,9 @@ class TestSynthRouting:
         state["retry_count"] = {"lint": 0, "sim": 0, "synth": 1}
         state["token_usage"] = 100000
         state["token_budget"] = 1000000
+        state["supervisor_call_count"] = 0
 
         result = _route_synth(state)
 
-        assert result == "debugger"
+        assert result == "supervisor"
         # Note: feedback_source is now set by node_synth, not the routing function

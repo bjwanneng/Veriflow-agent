@@ -166,29 +166,51 @@ def get_rollback_target(
 DEFAULT_TOKEN_BUDGET = 1_000_000  # 1M tokens default budget
 
 
-def check_token_budget(state: VeriFlowState) -> tuple[bool, str]:
+def _dedupe_extend(existing: list, new: list) -> list:
+    """LangGraph state reducer: merge two lists, preserving order and removing duplicates."""
+    return list(dict.fromkeys(existing + new))
+
+
+def check_token_budget(
+    state: VeriFlowState,
+) -> tuple[bool, str, str]:
     """Check if token usage is within budget.
 
     Args:
         state: Current pipeline state.
 
     Returns:
-        Tuple of (is_within_budget, message).
-        is_within_budget is False only when budget is exceeded (>100%).
-        Message is "" when under 80%, a warning at 80-100%, or an error above 100%.
+        Tuple of (should_proceed, message, budget_mode).
+        should_proceed: False only when budget is severely exceeded (>=120%).
+        message: "" when under 80%, a warning at 80-100%, or an error above 100%.
+        budget_mode: "normal" (<80%), "economy" (80-100%), "critical" (>=120%).
     """
     budget = state.get("token_budget", DEFAULT_TOKEN_BUDGET)
     usage = state.get("token_usage", 0)
 
     if budget <= 0:
-        return True, ""
+        return True, "", BUDGET_MODE_NORMAL
 
     ratio = usage / budget
+    if ratio >= 1.2:
+        return (
+            False,
+            f"Token budget severely exceeded: {usage}/{budget} ({ratio:.0%})",
+            BUDGET_MODE_CRITICAL,
+        )
     if ratio >= 1.0:
-        return False, f"Token budget exceeded: {usage}/{budget} ({ratio:.0%})"
+        return (
+            True,
+            f"Token budget exceeded: {usage}/{budget} ({ratio:.0%})",
+            BUDGET_MODE_ECONOMY,
+        )
     if ratio >= 0.8:
-        return True, f"Token budget warning: {usage}/{budget} ({ratio:.0%})"
-    return True, ""
+        return (
+            True,
+            f"Token budget warning: {usage}/{budget} ({ratio:.0%})",
+            BUDGET_MODE_ECONOMY,
+        )
+    return True, "", BUDGET_MODE_NORMAL
 
 
 @dataclass
@@ -245,6 +267,29 @@ class StageOutput:
 # Maximum retry attempts per check point (lint, sim, synth)
 MAX_RETRIES = 3
 
+# Maximum supervisor LLM calls per pipeline run (hard cap)
+MAX_SUPERVISOR_CALLS = 8
+
+# ── Tiered retry system for self-healing ──────────────────────────────────
+
+# Per-tier retry limits: simple debugger fix → strategy change → simplified design
+RETRY_TIERS: dict[str, int] = {
+    "simple_retry": 3,      # Normal debugger fix-and-retry
+    "strategy_change": 2,   # Different prompt/approach
+    "simplified": 1,        # Simplified design generation
+}
+
+# Absolute cap across all tiers per checkpoint
+MAX_TOTAL_RETRIES = 6
+
+# Tier escalation order
+TIER_ESCALATION_ORDER = ["simple_retry", "strategy_change", "simplified"]
+
+# Budget modes for cost-aware routing
+BUDGET_MODE_NORMAL = "normal"
+BUDGET_MODE_ECONOMY = "economy"
+BUDGET_MODE_CRITICAL = "critical"
+
 
 class VeriFlowState(TypedDict):
     """Complete state for the VeriFlow LangGraph.
@@ -297,13 +342,14 @@ class VeriFlowState(TypedDict):
     project_dir: str
 
     # LLM Configuration (propagated from session config / config.json)
+    llm_backend: str
     llm_api_key: str
     llm_base_url: str
     llm_model: str
 
     # Execution State
     current_stage: str
-    stages_completed: Annotated[list[str], lambda x, y: list(dict.fromkeys(x + y))]
+    stages_completed: Annotated[list[str], _dedupe_extend]
     stages_failed: list[str]
     retry_count: dict[str, int]
     error_history: dict[str, list[str]]
@@ -312,6 +358,18 @@ class VeriFlowState(TypedDict):
     # Multi-level Rollback
     error_categories: dict[str, str]         # checkpoint → ErrorCategory value
     target_rollback_stage: str               # "coder" | "microarch" | "timing" | "lint"
+
+    # ── Self-Healing (Tiered Retry + Escalation) ─────────────────────────
+    retry_tier: dict[str, str]               # checkpoint → current tier name
+    total_retries: dict[str, int]            # checkpoint → absolute retry count across tiers
+    escalation_history: list[dict]           # [{stage, tier, strategy, timestamp, outcome}]
+    strategy_override: dict[str, str]        # stage → strategy instruction for prompt
+    budget_mode: str                         # "normal" | "economy" | "critical"
+
+    # EDA tool availability and degraded mode
+    eda_tools_available: dict[str, bool]     # tool_name → available
+    eda_skip_stages: list[str]               # stages to skip due to missing tools
+    pipeline_complete_with_caveats: list[str]  # warnings for partial completion
 
     # Token Budget
     token_budget: int
@@ -332,8 +390,14 @@ class VeriFlowState(TypedDict):
     # Quality Gates
     quality_gates_passed: dict[str, bool]
 
+    # ── Supervisor (Intelligent Routing) ──────────────────────────────────
+    supervisor_call_count: int                     # Total supervisor invocations this run
+    supervisor_decision: dict | None               # Latest decision: {action, target_stage, hint, root_cause, severity}
+    supervisor_hint: str                           # Hint passed to the target recovery stage
+    supervisor_history: list[dict]                 # All decisions: [{action, target, hint, root_cause, timestamp}]
+
     # ── Real-time Observability (Phase 1 addition) ────────────────────────
-    event_stream: Annotated[list[dict], lambda x, y: x + y]
+    event_stream: Annotated[list[dict], _extend_events]
     event_stream_version: int
     active_stage: str | None
     active_stage_start_time: float | None
@@ -348,9 +412,15 @@ class VeriFlowState(TypedDict):
     messages: Annotated[Sequence, add_messages]
 
 
+def _extend_events(existing: list, new: list) -> list:
+    """LangGraph state reducer: append new events to existing event stream."""
+    return existing + new
+
+
 def create_initial_state(
     project_dir: str,
     token_budget: int = DEFAULT_TOKEN_BUDGET,
+    llm_backend: str = "claude_cli",
     llm_api_key: str = "",
     llm_base_url: str = "",
     llm_model: str = "",
@@ -360,12 +430,14 @@ def create_initial_state(
     Args:
         project_dir: Path to the project directory
         token_budget: Total token budget for the pipeline run
+        llm_backend: LLM backend to use ("claude_cli" | "openai" | "langchain")
 
     Returns:
         Initial VeriFlowState with default values
     """
     return VeriFlowState(
         project_dir=project_dir,
+        llm_backend=llm_backend,
         llm_api_key=llm_api_key,
         llm_base_url=llm_base_url,
         llm_model=llm_model,
@@ -376,19 +448,65 @@ def create_initial_state(
             "lint": 0,
             "sim": 0,
             "synth": 0,
+            "coder": 0,
+            "skill_d": 0,
+            "architect": 0,
+            "microarch": 0,
+            "timing": 0,
         },
         error_history={
             "lint": [],
             "sim": [],
             "synth": [],
+            "coder": [],
+            "skill_d": [],
+            "architect": [],
+            "microarch": [],
+            "timing": [],
         },
         feedback_source="",
         error_categories={
             "lint": "",
             "sim": "",
             "synth": "",
+            "coder": "",
+            "skill_d": "",
+            "architect": "",
+            "microarch": "",
+            "timing": "",
         },
         target_rollback_stage="lint",
+        # Self-healing fields
+        retry_tier={
+            "lint": "simple_retry",
+            "sim": "simple_retry",
+            "synth": "simple_retry",
+            "coder": "simple_retry",
+            "skill_d": "simple_retry",
+            "architect": "simple_retry",
+            "microarch": "simple_retry",
+            "timing": "simple_retry",
+        },
+        total_retries={
+            "lint": 0,
+            "sim": 0,
+            "synth": 0,
+            "coder": 0,
+            "skill_d": 0,
+            "architect": 0,
+            "microarch": 0,
+            "timing": 0,
+        },
+        escalation_history=[],
+        strategy_override={},
+        budget_mode=BUDGET_MODE_NORMAL,
+        eda_tools_available={
+            "iverilog": False,
+            "vvp": False,
+            "yosys": False,
+        },
+        eda_skip_stages=[],
+        pipeline_complete_with_caveats=[],
         token_budget=token_budget,
         token_usage=0,
         token_usage_by_stage={},
@@ -402,6 +520,11 @@ def create_initial_state(
         synth_output=None,
         debugger_output=None,
         quality_gates_passed={},
+        # Supervisor defaults
+        supervisor_call_count=0,
+        supervisor_decision=None,
+        supervisor_hint="",
+        supervisor_history=[],
         # Observability defaults
         event_stream=[],
         event_stream_version=0,

@@ -259,6 +259,19 @@ class BaseTool(ABC):
             else:
                 status = ToolStatus.FAILURE
                 errors = [f"Command failed with exit code {result.returncode}"]
+                # Include stderr/stdout content in errors for diagnosability
+                stderr_lines = (result.stderr or "").strip().splitlines()
+                stdout_lines = (result.stdout or "").strip().splitlines()
+                error_lines = [
+                    l for l in stderr_lines + stdout_lines
+                    if ": error:" in l.lower() or ": fatal:" in l.lower()
+                ]
+                if error_lines:
+                    # Include up to 10 parsed error lines
+                    errors.extend(error_lines[:10])
+                elif stderr_lines:
+                    # No parsed errors but stderr has content — include first 5 lines
+                    errors.extend(stderr_lines[:5])
 
             return ToolResult(
                 status=status,

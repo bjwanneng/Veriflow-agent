@@ -7,6 +7,11 @@ You are the **Coder** node in the VeriFlow pipeline. Your task is to read the ar
 - `workspace/docs/spec.json` - Architecture specification
 - `requirement.md` - Original requirements (for reference)
 
+## Supervisor Guidance (if this is a retry)
+{{SUPERVISOR_HINT}}
+
+**Important**: If the Supervisor has provided specific guidance above (e.g., "fix uart_rx.v missing module declaration"), you MUST address those specific issues in your generated RTL. The previous attempt failed - do not simply regenerate the same code.
+
 ## Output
 - `workspace/rtl/*.v` - Verilog RTL files (one per module)
 

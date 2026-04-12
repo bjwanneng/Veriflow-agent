@@ -32,7 +32,7 @@ class SynthAgent(BaseAgent):
             required_inputs=["workspace/docs/spec.json"],
             output_artifacts=["workspace/docs/synth_report.json"],
             max_retries=1,
-            llm_backend="openai",
+            llm_backend="claude_cli",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:

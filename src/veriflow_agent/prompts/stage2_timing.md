@@ -4,7 +4,13 @@
 You are the **Timing Modeler** node in the VeriFlow pipeline. Your task is to translate the architecture specification into a human-readable timing model and a corresponding testbench that shares the same stimulus source.
 
 ## Input
-- `workspace/docs/spec.json` — Architecture specification (read this first)
+
+The spec.json content is provided directly below. You do NOT need to read any files from disk.
+
+### spec.json
+```json
+{{SPEC_JSON}}
+```
 
 ## Output
 - `workspace/docs/timing_model.yaml` — Behavior assertions + stimulus sequences
@@ -59,11 +65,22 @@ Create `workspace/tb/tb_<design_name>.v` that provides **full functional coverag
 4. Error/corner cases: invalid inputs, overflow conditions (if spec mentions them)
 5. For each KPI in `target_kpis`: at least one test scenario that exercises that metric
 
+**⚠️ CRITICAL: iverilog Compatibility**
+
+The testbench will be compiled and run with **iverilog** (Icarus Verilog), which has limited SystemVerilog support:
+- ❌ NO support for SVA (`assert property`, `|->`, `|=>`, `##` delay operator)
+- ❌ NO support for `logic` type (use `reg`/`wire`)
+- ❌ NO support for `always_ff`/`always_comb` (use `always`)
+- ✅ YES support for `$display`, `$monitor`, `$finish`, `$dumpfile`
+
+**You MUST implement assertions using ONLY standard Verilog with $display checks. NO SVA syntax.**
+
 **Testbench must:**
 1. Instantiate the top module with **all ports connected** (no unconnected ports)
 2. Generate clock with period derived from `target_frequency_mhz`
-3. Apply stimulus sequences **exactly as described in timing_model.yaml**
-4. Check every assertion using `$display("PASS: ...")` / `$display("FAIL: ...")`
+3. Apply stimulus sequences **exactly as described in timing_model.yaml stimulus section**
+4. **Implement ALL assertions from timing_model.yaml as iverilog-compatible Verilog checks** — see conversion patterns below
+5. Check every assertion using `$display("PASS: ...")` / `$display("FAIL: ...")`
 5. Track a `fail_count` integer; print `ALL TESTS PASSED` or `FAILED: N assertion(s) failed`
 6. Call `$finish` after all test cases complete
 7. Use `$dumpfile` / `$dumpvars` for waveform capture
@@ -134,15 +151,72 @@ module tb_<design_name>;
 endmodule
 ```
 
-**Assertion checking pattern:**
+**CRITICAL: Convert YAML SVA assertions to iverilog-compatible Verilog**
+
+The YAML assertions use SVA-like syntax for readability. You MUST convert them to standard Verilog that iverilog can compile:
+
+| YAML Assertion (SVA-like) | iverilog-compatible Verilog |
+|---------------------------|----------------------------|
+| `i_valid \|-> ##2 o_done` | Wait exactly 2 cycles, then check with `if (o_done !== 1'b1)` |
+| `!rst_n \|-> ##1 data == 0` | After reset, wait 1 cycle, check `if (data !== 0)` |
+| `tx_en == 1 \|-> ##[1:3] tx_busy == 1` | Use `repeat(3)` loop with early exit when condition met |
+| `tx_busy == 1 \|-> ##[4320:4400] rx_done == 1` | `repeat(4320)` wait, then poll for max 80 cycles |
+
+**Assertion implementation patterns (iverilog compatible - NO SVA):**
+
 ```verilog
-// Check: i_valid |-> ##2 o_done
-@(posedge clk); #0.1;
-if (o_done !== 1'b1) begin
-    $display("FAIL: Expected o_done=1 at cycle 2 after i_valid");
+// Pattern 1: Fixed delay (e.g., "|-> ##2 o_done")
+// Wait exactly N cycles after trigger, then check
+@(posedge clk); trigger = 1; @(posedge clk); trigger = 0;  // Trigger event
+@(posedge clk); @(posedge clk);  // Wait 2 cycles
+if (o_done !== 1'b1) begin  // Check at cycle 2
+    $display("FAIL: o_done not asserted after 2 cycles");
     fail_count = fail_count + 1;
 end else begin
-    $display("PASS: o_done asserted correctly");
+    $display("PASS: o_done asserted after 2 cycles");
+end
+
+// Pattern 2: Delay range (e.g., "|-> ##[1:3] signal")
+// Check condition within cycle range using loop
+integer cycle_cnt;
+reg condition_met;
+condition_met = 0;
+for (cycle_cnt = 0; cycle_cnt < 3; cycle_cnt = cycle_cnt + 1) begin
+    @(posedge clk); #0.1;
+    if (expected_signal === 1'b1) begin
+        condition_met = 1;
+        $display("PASS: signal asserted at cycle %0d", cycle_cnt+1);
+    end
+end
+if (!condition_met) begin
+    $display("FAIL: signal not asserted within 1-3 cycles");
+    fail_count = fail_count + 1;
+end
+
+// Pattern 3: Long delay window (e.g., serial: "|-> ##[4320:4400] rx_done")
+integer poll_cnt;
+repeat(4320) @(posedge clk);  // Minimum wait
+poll_cnt = 0;
+while (rx_done !== 1'b1 && poll_cnt < 80) begin
+    @(posedge clk); #0.1;
+    poll_cnt = poll_cnt + 1;
+end
+if (rx_done !== 1'b1) begin
+    $display("FAIL: rx_done not asserted in window 4320-4400");
+    fail_count = fail_count + 1;
+end else begin
+    $display("PASS: rx_done asserted at cycle %0d", 4320 + poll_cnt);
+end
+
+// Pattern 4: Reset check (e.g., "!rst_n |-> ##1 data == 0")
+@(negedge rst_n);  // Reset asserted
+@(posedge rst_n);  // Reset released
+@(posedge clk); #0.1;  // One cycle after reset
+if (data !== 8'h00) begin
+    $display("FAIL: data not cleared one cycle after reset");
+    fail_count = fail_count + 1;
+end else begin
+    $display("PASS: data cleared after reset");
 end
 ```
 
@@ -168,8 +242,27 @@ end
 - Each scenario must contain `name`, `assertions`, and `stimulus`
 - The testbench must compile cleanly with iverilog (use `reg`/`wire` not `logic`)
 - Use `$display` not `$error` for compatibility with iverilog
+- **NO SVA keywords in testbench**: do NOT use `assert`, `property`, `sequence`, `|->`, `|=>`, `##`, `always_ff`, `always_comb`, `logic`
 
 ## Output Format
+
+You must output the files using standard markdown code blocks. This is required for the system to parse your output correctly.
+
+**For timing_model.yaml, use:**
+```yaml
+design: <design_name>
+scenarios:
+  - name: <scenario_name>
+    ...
+```
+
+**For the testbench, use:**
+```verilog
+`timescale 1ns/1ps
+module tb_<design_name>;
+    ...
+endmodule
+```
 
 After generating both files, print a summary:
 
@@ -184,4 +277,10 @@ STAGE_COMPLETE
 =======================================
 ```
 
-**IMPORTANT**: After generating both files, exit immediately. Do not run any simulation commands. The Python controller will present these files to the user for review before proceeding.
+**CRITICAL**: 
+1. You MUST generate BOTH files: timing_model.yaml AND tb_<design_name>.v
+2. Use ```yaml and ```verilog code blocks - this is REQUIRED
+3. The testbench MUST implement ALL scenarios and assertions from the YAML using **iverilog-compatible standard Verilog only**
+4. **NO SVA syntax**: do NOT use `assert property`, `|->`, `##`, `logic`, `always_ff`
+5. Do not put explanatory text inside the code blocks
+6. After generating both files, exit immediately. The Python controller will handle the files.

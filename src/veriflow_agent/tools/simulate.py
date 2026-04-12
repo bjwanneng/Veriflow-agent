@@ -56,7 +56,7 @@ class VvpTool(BaseTool):
     Usage:
         tool = VvpTool()
         if tool.validate_prerequisites():
-            result = tool.run(testbench="rtl/tb_alu.v", rtl_files=["rtl/alu.v"])
+            result = tool.run(testbench="rtl/tb_top.v", rtl_files=["rtl/top.v"])
             sim = tool.parse_sim_output(result)
     """
 

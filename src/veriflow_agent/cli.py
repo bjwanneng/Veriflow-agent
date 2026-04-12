@@ -69,6 +69,7 @@ def run(project_dir: str, resume: bool):
             console.print("[yellow]No checkpoint found, starting fresh.")
             state = create_initial_state(
                 str(project_dir),
+                llm_backend=_cfg.llm_backend,
                 llm_api_key=_llm.api_key,
                 llm_base_url=_llm.base_url,
                 llm_model=_llm.model,
@@ -78,6 +79,7 @@ def run(project_dir: str, resume: bool):
     else:
         state = create_initial_state(
             str(project_dir),
+            llm_backend=_cfg.llm_backend,
             llm_api_key=_llm.api_key,
             llm_base_url=_llm.base_url,
             llm_model=_llm.model,
@@ -428,30 +430,20 @@ def gateway(host: str, port: int, workspace: str | None, telegram: bool, verbose
 
 
 @cli.command()
-@click.option("--host", default="127.0.0.1", help="Gateway host to connect to.")
-@click.option("--port", default=18789, help="Gateway port to connect to.")
-@click.option("--session-id", default=None, help="Session ID to resume.")
-@click.option("--workspace", "-w", default=None, help="Workspace directory (default: current directory).")
-@click.option("--verbose", "-v", is_flag=True, default=False, help="DEBUG level logging (show all chunks, messages).")
-@click.option("--quiet", "-q", is_flag=True, default=False, help="WARNING level logging (errors only).")
-def tui(host: str, port: int, session_id: str | None, workspace: str | None, verbose: bool, quiet: bool):
-    """Launch the TUI client (connects to Gateway via WebSocket).
-
-    This is a terminal-based chat client that connects to a running Gateway.
+@click.option("--project-dir", "-p", default=None, help="Path to project directory (optional).")
+@click.option("--mode", default="standard", type=click.Choice(["quick", "standard", "enterprise"]), help="Pipeline mode.")
+def tui(project_dir: str | None, mode: str):
+    """Launch the terminal UI (self-contained, no gateway required).
 
     Usage:
-        # Terminal 1: Start the Gateway
-        veriflow-agent gateway
-
-        # Terminal 2: Connect with TUI client
         veriflow-agent tui
+        veriflow-agent tui --project-dir ./my_alu
+        veriflow-agent tui --project-dir ./my_alu --mode quick
     """
-    from veriflow_agent.tui_client import launch_tui
+    from veriflow_agent.tui import launch_tui
 
-    # Default workspace = CWD if not specified
-    ws = workspace or str(Path.cwd())
-
-    launch_tui(host=host, port=port, session_id=session_id, workspace=ws, verbose=verbose, quiet=quiet)
+    project_path = Path(project_dir) if project_dir else None
+    launch_tui(project_dir=project_path, mode=mode)
 
 
 def main():

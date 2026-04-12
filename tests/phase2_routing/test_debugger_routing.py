@@ -1,12 +1,13 @@
 """Tests for Debugger multi-level rollback routing.
 
-Verifies that the debugger routes to the correct target stage based on
-error category and feedback source.
+Verifies that the debugger routes to the supervisor for re-evaluation,
+with fallback to mechanical target when supervisor cap is reached.
 """
 
 
 from veriflow_agent.graph.graph import _route_debugger
 from veriflow_agent.graph.state import (
+    MAX_SUPERVISOR_CALLS,
     ErrorCategory,
     categorize_error,
     get_rollback_target,
@@ -147,47 +148,82 @@ class TestGetRollbackTarget:
 class TestDebuggerRouting:
     """Tests for debugger routing function."""
 
-    def test_route_debugger_to_coder(self):
-        """Test debugger routes to coder target."""
+    def test_route_debugger_to_supervisor_with_coder_target(self):
+        """Test debugger routes to supervisor when coder is target."""
         state = {
             "project_dir": "/tmp/test",
             "target_rollback_stage": "coder",
+            "supervisor_call_count": 0,
+        }
+        result = _route_debugger(state)
+        assert result == "supervisor"
+
+    def test_route_debugger_to_supervisor_with_microarch_target(self):
+        """Test debugger routes to supervisor when microarch is target."""
+        state = {
+            "project_dir": "/tmp/test",
+            "target_rollback_stage": "microarch",
+            "supervisor_call_count": 0,
+        }
+        result = _route_debugger(state)
+        assert result == "supervisor"
+
+    def test_route_debugger_to_supervisor_with_timing_target(self):
+        """Test debugger routes to supervisor when timing is target."""
+        state = {
+            "project_dir": "/tmp/test",
+            "target_rollback_stage": "timing",
+            "supervisor_call_count": 0,
+        }
+        result = _route_debugger(state)
+        assert result == "supervisor"
+
+    def test_route_debugger_to_supervisor_with_lint_target(self):
+        """Test debugger routes to supervisor when lint is target."""
+        state = {
+            "project_dir": "/tmp/test",
+            "target_rollback_stage": "lint",
+            "supervisor_call_count": 0,
+        }
+        result = _route_debugger(state)
+        assert result == "supervisor"
+
+    def test_route_debugger_default_to_supervisor(self):
+        """Test debugger defaults to supervisor when no target set."""
+        state = {
+            "project_dir": "/tmp/test",
+            # target_rollback_stage not set
+            "supervisor_call_count": 0,
+        }
+        result = _route_debugger(state)
+        assert result == "supervisor"
+
+    def test_route_debugger_fallback_to_coder_at_cap(self):
+        """Test debugger falls back to coder target when supervisor cap reached."""
+        state = {
+            "project_dir": "/tmp/test",
+            "target_rollback_stage": "coder",
+            "supervisor_call_count": MAX_SUPERVISOR_CALLS,
         }
         result = _route_debugger(state)
         assert result == "coder"
 
-    def test_route_debugger_to_microarch(self):
-        """Test debugger routes to microarch target."""
+    def test_route_debugger_fallback_to_microarch_at_cap(self):
+        """Test debugger falls back to microarch target when supervisor cap reached."""
         state = {
             "project_dir": "/tmp/test",
             "target_rollback_stage": "microarch",
+            "supervisor_call_count": MAX_SUPERVISOR_CALLS,
         }
         result = _route_debugger(state)
         assert result == "microarch"
 
-    def test_route_debugger_to_timing(self):
-        """Test debugger routes to timing target."""
-        state = {
-            "project_dir": "/tmp/test",
-            "target_rollback_stage": "timing",
-        }
-        result = _route_debugger(state)
-        assert result == "timing"
-
-    def test_route_debugger_to_lint(self):
-        """Test debugger routes to lint target."""
-        state = {
-            "project_dir": "/tmp/test",
-            "target_rollback_stage": "lint",
-        }
-        result = _route_debugger(state)
-        assert result == "lint"
-
-    def test_route_debugger_default_to_lint(self):
-        """Test debugger defaults to lint when no target set."""
+    def test_route_debugger_fallback_to_lint_default_at_cap(self):
+        """Test debugger falls back to lint (default) when cap reached and no target."""
         state = {
             "project_dir": "/tmp/test",
             # target_rollback_stage not set
+            "supervisor_call_count": MAX_SUPERVISOR_CALLS,
         }
         result = _route_debugger(state)
         assert result == "lint"

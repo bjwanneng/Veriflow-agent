@@ -21,7 +21,7 @@ class VeriFlowConfig:
     """Gateway + LLM + Telegram configuration."""
 
     # LLM
-    llm_backend: str = "openai"  # openai | langchain  (OpenAI-compatible format)
+    llm_backend: str = "claude_cli"  # claude_cli | openai | langchain
     api_key: str = ""
     base_url: str = ""
     model: str = ""
@@ -73,14 +73,7 @@ class VeriFlowConfig:
     def _apply_env(self) -> VeriFlowConfig:
         """Override fields from environment variables."""
         if v := os.getenv("VERIFLOW_LLM_BACKEND"):
-            if v == "claude_cli":
-                import logging as _logging
-                _logging.getLogger("veriflow").warning(
-                    "VERIFLOW_LLM_BACKEND=claude_cli is disabled; falling back to 'openai'"
-                )
-                self.llm_backend = "openai"
-            else:
-                self.llm_backend = v
+            self.llm_backend = v
         if v := os.getenv("VERIFLOW_API_KEY"):
             self.api_key = v
         if v := os.getenv("VERIFLOW_BASE_URL"):

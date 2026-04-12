@@ -66,6 +66,21 @@ VeriFlow-Agent is a Python 3.10+ project that implements a 7-stage RTL design pi
 
 **3. Graph layer** (`src/veriflow_agent/graph/`): `graph.py` assembles a LangGraph `StateGraph` from the 7 agent nodes with conditional edges for mode-based routing and retry loops. `state.py` defines `VeriFlowState` (TypedDict) and `StageOutput` (dataclass). Checkpointing uses `MemorySaver` for resume capability.
 
+### Self-Healing Architecture
+
+The pipeline uses a **fully LLM-driven** self-healing system. When any stage fails:
+
+1. **SupervisorAgent** (LLM) analyzes the failure with full project context (error logs, RTL files, spec, environment)
+2. Supervisor decides: `retry_stage`, `escalate_stage`, `degrade`, `continue`, or `abort`
+3. If Supervisor routes to Debugger and Debugger also fails, Supervisor is called **again** with `debugger_failure_note` to choose a different strategy
+4. All routing decisions are made by the LLM — no regex-based keyword matching or mechanical stage jumping
+
+**Key principle: LLM does all routing. Code only executes LLM decisions, enforces retry limits, and notifies the UI. If the LLM is unavailable, the pipeline pauses and asks the user — never guesses mechanically.**
+
+### Partial Pipeline Runs
+
+When users request incremental execution (e.g., "从 lint 开始执行"), `_run_pipeline_partial` uses the **full** `STAGE_ORDER` list. Stages before the requested start point are skipped, but the list is not truncated — this allows rollback to earlier stages (e.g., lint failure → rollback to coder). The `start_idx` is dynamically updated when a rollback targets an earlier stage.
+
 ### Pipeline Stages
 
 | Stage | Agent | Output artifact |

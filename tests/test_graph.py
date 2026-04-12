@@ -206,28 +206,28 @@ class TestTokenBudget:
     def test_under_80_percent(self):
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 500
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
         assert ok is True
         assert msg == ""
 
     def test_at_80_percent_warning(self):
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 800
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
         assert ok is True
         assert "warning" in msg.lower()
 
-    def test_over_100_percent_exceeded(self):
+    def test_over_120_percent_critical(self):
         state = create_initial_state("/tmp", token_budget=1000)
         state["token_usage"] = 1200
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
         assert ok is False
         assert "exceeded" in msg.lower()
 
     def test_zero_budget_always_ok(self):
         state = create_initial_state("/tmp", token_budget=0)
         state["token_usage"] = 99999
-        ok, msg = check_token_budget(state)
+        ok, msg, mode = check_token_budget(state)
         assert ok is True
 
     def test_default_budget(self):
@@ -280,14 +280,21 @@ class TestGraphCompilation:
         expected = [
             "__start__", "architect", "microarch", "timing",
             "coder", "skill_d", "lint", "sim", "synth", "debugger",
+            "supervisor",
         ]
         for name in expected:
             assert name in node_names, f"Missing node: {name}"
 
-    def test_graph_has_debugger_node(self):
+    def test_graph_has_supervisor_node(self):
         graph = create_veriflow_graph(with_checkpointer=False)
         node_names = list(graph.nodes.keys())
-        assert "debugger" in node_names
+        assert "supervisor" in node_names
+
+    def test_graph_has_no_escalator_node(self):
+        """Escalator has been replaced by the supervisor."""
+        graph = create_veriflow_graph(with_checkpointer=False)
+        node_names = list(graph.nodes.keys())
+        assert "escalator" not in node_names
 
 
 # ── Node wrappers (with mock) ─────────────────────────────────────────

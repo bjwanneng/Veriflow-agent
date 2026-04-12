@@ -158,48 +158,139 @@ class TestFormatters:
 class TestChatHandler:
     def test_classify_intent_new(self):
         handler = PipelineChatHandler()
+        # All messages now go through LLM-driven analysis
         intent = handler._classify_intent("Design a 4-bit ALU", [])
-        assert intent == "design"
+        assert intent == "llm_analyze"
 
     def test_classify_intent_inspect(self):
         handler = PipelineChatHandler()
         history = [{"role": "assistant", "content": "Pipeline Complete!"}]
+        # L1: All messages now return "llm_analyze" — LLM decides inspect vs design
         intent = handler._classify_intent("show me the RTL code", history)
-        assert intent == "inspect"
+        assert intent == "llm_analyze"
 
     def test_classify_intent_modify(self):
         handler = PipelineChatHandler()
         history = [{"role": "assistant", "content": "Pipeline Complete!"}]
-        intent = handler._classify_intent("add shift-left to the ALU", history)
+        # L1: All messages now return "llm_analyze" — LLM decides modify vs design
+        intent = handler._classify_intent("add a port for shift-left to the ALU", history)
+        assert intent == "llm_analyze"
+
+    def test_classify_intent_fallback_inspect(self):
+        """Verify keyword fallback works when LLM is unavailable."""
+        history = [{"role": "assistant", "content": "Pipeline Complete!"}]
+        intent = PipelineChatHandler._classify_intent_fallback("show me the RTL code", history)
+        assert intent == "inspect"
+
+    def test_classify_intent_fallback_modify(self):
+        """Verify keyword fallback works when LLM is unavailable."""
+        history = [{"role": "assistant", "content": "Pipeline Complete!"}]
+        intent = PipelineChatHandler._classify_intent_fallback("add a port to the ALU", history)
         assert intent == "modify"
 
+    def test_classify_intent_fallback_design(self):
+        """Verify keyword fallback defaults to design for non-matching input."""
+        intent = PipelineChatHandler._classify_intent_fallback("Design a 4-bit ALU", [])
+        assert intent == "design"
+
     def test_inspection_no_project(self):
+        """Verify inspection flow: LLM decides inspect → no project → error message."""
         handler = PipelineChatHandler()
-        # With history containing pipeline output, this is classified as inspection
         history = [{"role": "assistant", "content": "Pipeline Complete!"}]
-        responses = list(handler.handle_message(
-            "show me the RTL code", history, session_id="test_no_proj4",
-        ))
-        assert len(responses) > 0
-        combined = " ".join(responses).lower()
-        # Should tell user no project exists
-        assert "no project" in combined or "start" in combined or "no" in combined
+        # Mock LLM to return "inspect" mode (simulating LLM intent classification)
+        import json
+        inspect_json = json.dumps({
+            "mode": "inspect",
+            "reasoning": "User wants to see RTL",
+            "target_files": ["rtl"],
+        })
+        with patch("veriflow_agent.chat.handler.call_llm_stream") as mock_llm:
+            mock_llm.return_value = iter([inspect_json])
+            responses = list(handler.handle_message(
+                "show me the RTL code", history, session_id="test_no_proj4",
+            ))
+            assert len(responses) > 0
+            combined = " ".join(responses).lower()
+            # Should tell user no project exists
+            assert "no project" in combined or "start" in combined or "no" in combined
 
     def test_new_design_creates_project(self, tmp_path):
-        """Verify new design creates a project directory."""
-        handler = PipelineChatHandler()
-        # Mock the pipeline graph to avoid actual execution
-        with patch("veriflow_agent.chat.handler.create_veriflow_graph") as mock_graph:
-            mock_instance = MagicMock()
-            mock_instance.stream.return_value = iter([])  # No events
-            mock_instance.get_state.return_value = MagicMock(values={})
-            mock_graph.return_value = mock_instance
+        """Verify start_pipeline tool creates a project directory.
 
+        We mock OrchestratorAgent.run() to simulate what happens when
+        the LLM decides to call start_pipeline: it sets _project_dirs
+        and yields a response.
+        """
+        handler = PipelineChatHandler()
+
+        def fake_orchestrator_run(self_orch, message, history, event_callback):
+            """Simulate orchestrator calling start_pipeline tool."""
+            from pathlib import Path
+            import tempfile
+            project_dir = Path(tempfile.mkdtemp(prefix="veriflow-test-"))
+            (project_dir / "workspace" / "docs").mkdir(parents=True, exist_ok=True)
+            (project_dir / "workspace" / "rtl").mkdir(parents=True, exist_ok=True)
+            (project_dir / "workspace" / "tb").mkdir(parents=True, exist_ok=True)
+            (project_dir / "workspace" / "logs").mkdir(parents=True, exist_ok=True)
+            self_orch.handler._project_dirs[self_orch.session_id] = project_dir
+            yield "Pipeline started successfully."
+
+        with patch(
+            "veriflow_agent.chat.orchestrator.OrchestratorAgent.run",
+            fake_orchestrator_run,
+        ):
             responses = list(handler.handle_message(
                 "Design a 4-bit ALU", [], session_id="test_new2",
             ))
 
-            # Should have at least the start message
             assert len(responses) > 0
-            # Project dir should be created
             assert "test_new2" in handler._project_dirs
+
+
+class TestToolCallingMessageFormat:
+    """Verify that tool_calls and tool_call_id are preserved in API messages."""
+
+    def test_tool_call_id_preserved_in_stream(self):
+        """_stream_openai must preserve tool_call_id in role:tool messages."""
+        from veriflow_agent.chat.llm import _stream_openai, LLMConfig
+
+        config = LLMConfig(api_key="test-key", base_url="http://localhost:1234")
+        messages = [
+            {"role": "user", "content": "test"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_abc123",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": '{"path": "rtl.v"}'},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_abc123", "content": "module top; endmodule"},
+        ]
+
+        with patch("veriflow_agent.chat.llm._make_openai_client") as mock_client_fn:
+            mock_client = MagicMock()
+            mock_client_fn.return_value = mock_client
+            # Simulate empty streaming response
+            mock_chunk = MagicMock()
+            mock_chunk.choices = []
+            mock_client.chat.completions.create.return_value = iter([mock_chunk])
+
+            list(_stream_openai(messages, config, "system prompt"))
+
+            # Verify the API was called with messages preserving tool_call_id
+            call_args = mock_client.chat.completions.create.call_args
+            api_messages = call_args.kwargs["messages"]
+
+            # System prompt + user + assistant + tool = 4 messages
+            assert len(api_messages) == 4
+            assert api_messages[0]["role"] == "system"
+            assert api_messages[1]["role"] == "user"
+            # Assistant message must have tool_calls
+            assert api_messages[2]["role"] == "assistant"
+            assert "tool_calls" in api_messages[2]
+            assert api_messages[2]["tool_calls"][0]["id"] == "call_abc123"
+            # Tool message must have tool_call_id
+            assert api_messages[3]["role"] == "tool"
+            assert api_messages[3]["tool_call_id"] == "call_abc123"

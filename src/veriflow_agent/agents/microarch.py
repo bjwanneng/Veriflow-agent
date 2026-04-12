@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from veriflow_agent.agents.base import AgentResult, BaseAgent
+from veriflow_agent.agents.output_extractor import StreamingOutputExtractor
 
 
 class MicroArchAgent(BaseAgent):
@@ -27,7 +28,7 @@ class MicroArchAgent(BaseAgent):
             required_inputs=["workspace/docs/spec.json"],
             output_artifacts=["workspace/docs/micro_arch.md"],
             max_retries=1,
-            llm_backend="openai",
+            llm_backend="claude_cli",
         )
 
     def execute(self, context: dict[str, Any]) -> AgentResult:
@@ -70,16 +71,25 @@ class MicroArchAgent(BaseAgent):
         }
 
         # Step 5: Invoke LLM (with streaming if EventCollector available)
+        # Use markdown_after_heading extractor to separate thinking from
+        # the actual micro_arch.md content (which starts with a # heading).
+        extractor = StreamingOutputExtractor(extract_mode="markdown_after_heading")
         try:
             prompt = self.render_prompt(llm_context)
 
             # Check if EventCollector is available for streaming
             event_collector = context.get("_event_collector")
             if event_collector:
-                llm_output = self._consume_streaming(context, prompt, event_collector)
+                llm_output = self._consume_streaming(
+                    context, prompt, event_collector,
+                    output_extractor=extractor,
+                )
             else:
                 # Fall back to blocking call
-                llm_output = self.call_llm(context, prompt_override=prompt)
+                llm_output = self.call_llm(
+                    context, prompt_override=prompt,
+                    output_extractor=extractor,
+                )
         except Exception as e:
             return AgentResult(
                 success=False,
@@ -87,12 +97,10 @@ class MicroArchAgent(BaseAgent):
                 errors=[f"LLM invocation failed: {e}"],
             )
 
-        # Step 6: Check if file was written by LLM, or write it ourselves
+        # Step 6: Write output to file (always overwrite with clean extracted content)
         output_path = project_dir / "workspace" / "docs" / "micro_arch.md"
         output_path.parent.mkdir(parents=True, exist_ok=True)
-
-        if not output_path.exists():
-            output_path.write_text(llm_output, encoding="utf-8")
+        output_path.write_text(llm_output, encoding="utf-8")
 
         # Step 7: Validate output
         content = output_path.read_text(encoding="utf-8")

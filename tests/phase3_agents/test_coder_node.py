@@ -194,7 +194,7 @@ endmodule
 
         call_count = [0]
 
-        def mock_call_llm(context, prompt_override=None):
+        def mock_call_llm(context, prompt_override=None, output_extractor=None):
             call_count[0] += 1
             # Extract module name from prompt
             if "adder" in prompt_override or "adder" in str(context):
